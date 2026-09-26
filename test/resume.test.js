@@ -59,25 +59,48 @@ describe('resume', () => {
 
   it('single-stream kill then rerun resumes from the sidecar', { timeout: 180000 }, async () => {
     const work = H.workdir('resume-single');
-    const src = H.makeFile(work, 'src.bin', 12 * 1024 * 1024);
-    const srv = await H.startServer(
-      { '/f.bin': { buf: fs.readFileSync(src.path), tmp: path.join(work, 'srv.tmp') } },
-      () => ({ slowBps: 2 * 1024 * 1024 }),
-    );
+    const crypto = require('crypto');
+    const buf = crypto.randomBytes(12 * 1024 * 1024);
+    const hash = crypto.createHash('sha256').update(buf).digest('hex');
+    let served = 0;
+    const s = require('http').createServer((q, res) => {
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0;
+      res.writeHead(m ? 206 : 200, {
+        'Content-Length': buf.length - a,
+        ...(m ? { 'Content-Range': `bytes ${a}-${buf.length - 1}/${buf.length}` } : {}),
+      });
+      let off = a;
+      const tick = () => {
+        if (res.destroyed) return;
+        const n = Math.min(64 * 1024, buf.length - off);
+        served += n;
+        res.write(buf.subarray(off, off + n));
+        off += n;
+        if (off >= buf.length) res.end();
+        else setTimeout(tick, 30); // ~2MB/s
+      };
+      tick();
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
     try {
+      const fileUrl = `http://127.0.0.1:${s.address().port}/f.bin`;
       const out = path.join(work, 'out.bin');
-      const child = spawn('node', [H.AGENT_DLA, srv.url('/f.bin'), '-o', out, '-n', '1'], { cwd: work });
+      const child = spawn('node', [H.AGENT_DLA, fileUrl, '-o', out, '-n', '1'], { cwd: work });
       const closed = new Promise((r) => child.on('close', r));
-      await H.sleep(2500); // 3MB chunks at ~2MB/s: mid-flight
-
+      await H.sleep(2500);
       child.kill();
       await closed;
       assert.ok(fs.existsSync(out + '.single.json'), 'sidecar kept after kill');
-      const r = await H.runAccel([srv.url('/f.bin'), '-o', out, '-n', '1', '--json'], { cwd: work });
+      const kept = fs.existsSync(out + '.partial') ? fs.statSync(out + '.partial').size : 0;
+      assert.ok(kept > 0, 'partial bytes kept after kill');
+      served = 0;
+      const r = await H.runAccel([fileUrl, '-o', out, '-n', '1', '--json'], { cwd: work });
       assert.equal(r.code, 0);
-      assert.equal(H.sha256(out), src.hash);
+      assert.equal(H.sha256(out), hash);
+      assert.ok(served < buf.length - kept / 2, `rerun resumed (${(served / 1048576).toFixed(1)}MB re-transferred of 12MB, kept ${(kept / 1048576).toFixed(1)}MB)`);
     } finally {
-      await srv.close();
+      s.close();
     }
   });
 

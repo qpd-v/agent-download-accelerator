@@ -68,35 +68,29 @@ function loadConfig() {
   const cli = (name) => program.getOptionValueSource(name) === 'cli';
   // Sensitive keys are only honored from an explicit --config. An agent-dla.json
   // sitting in the working directory could come from an untrusted checkout.
-  const allowSensitive = explicit;
   const blocked = [];
+  const sensitive = (key, apply) => {
+    if (explicit) apply();
+    else blocked.push(key);
+  };
   if (!cli('connections') && cfg.connections !== undefined) opts.connections = String(cfg.connections);
   if (!cli('timeout') && cfg.timeout !== undefined) opts.timeout = String(cfg.timeout);
   if (!cli('retries') && cfg.retries !== undefined) opts.retries = String(cfg.retries);
   if (!cli('maxRetries') && cfg.maxRetries !== undefined) opts.maxRetries = String(cfg.maxRetries);
   if (!cli('deadline') && cfg.deadline !== undefined) opts.deadline = String(cfg.deadline);
-  if (!cli('proxies') && cfg.proxies) {
-    if (allowSensitive) opts.proxies = (explicit && !path.isAbsolute(cfg.proxies)) ? path.join(path.dirname(p), cfg.proxies) : cfg.proxies;
-    else blocked.push('proxies');
-  }
-  if (!cli('mirror') && Array.isArray(cfg.mirrors)) {
-    if (allowSensitive) opts.mirror = cfg.mirrors;
-    else blocked.push('mirrors');
-  }
-  if (!cli('dir') && cfg.outputDir) opts.dir = cfg.outputDir;
-  if (!cli('header') && Array.isArray(cfg.headers)) opts.header = cfg.headers.map(String);
+  if (!cli('proxies') && cfg.proxies) sensitive('proxies', () => {
+    opts.proxies = !path.isAbsolute(cfg.proxies) ? path.join(path.dirname(p), cfg.proxies) : cfg.proxies;
+  });
+  if (!cli('mirror') && Array.isArray(cfg.mirrors) && cfg.mirrors.length) sensitive('mirrors', () => { opts.mirror = cfg.mirrors; });
+  if (!cli('dir') && cfg.outputDir) sensitive('outputDir', () => { opts.dir = cfg.outputDir; });
+  if (!cli('header') && Array.isArray(cfg.headers) && cfg.headers.length) sensitive('headers', () => { opts.header = cfg.headers.map(String); });
   if (!cli('json') && cfg.json) opts.json = true;
-  if (!cli('insecure') && cfg.insecure) {
-    if (allowSensitive) opts.insecure = true;
-    else blocked.push('insecure');
-  }
+  if (!cli('insecure') && cfg.insecure) sensitive('insecure', () => { opts.insecure = true; });
   if (program.getOptionValueSource('autoRefresh') !== 'cli' && (cfg.autoRefresh === false || cfg.noAutoRefresh === true)) opts.autoRefresh = false;
   if (cfg.harvestTimeout) HARVEST_TIMEOUT_MS = parseInt(cfg.harvestTimeout, 10) || 0;
-  if (cfg.harvestScript) {
-    if (allowSensitive) {
-      HARVEST_SCRIPT = path.isAbsolute(cfg.harvestScript) ? cfg.harvestScript : path.join(path.dirname(p), cfg.harvestScript);
-    } else blocked.push('harvestScript');
-  }
+  if (cfg.harvestScript) sensitive('harvestScript', () => {
+    HARVEST_SCRIPT = path.isAbsolute(cfg.harvestScript) ? cfg.harvestScript : path.join(path.dirname(p), cfg.harvestScript);
+  });
   if (program.getOptionValueSource('redact') !== 'cli' && cfg.redact) opts.redact = true;
   if (program.getOptionValueSource('overwrite') !== 'cli' && cfg.overwrite) opts.overwrite = true;
   if (program.getOptionValueSource('allowHtml') !== 'cli' && cfg.allowHtml) opts.allowHtml = true;
@@ -127,6 +121,13 @@ const DEADLINE_MS = numOpt(opts.deadline, 0, 0, 86400000);
 let DL_AT = 0; // per-file deadline timestamp, set in the batch loop
 let DL_FIRED = false; // set by the deadline timer; data handlers cancel in-flight requests
 let dlTimer = null;
+const DL_REQS = new Set(); // live request objects, destroyed when the deadline fires
+function deadlineErr() { return Object.assign(new Error('deadline exceeded'), { fatal: true }); }
+function trackReq(req) {
+  DL_REQS.add(req);
+  req.on('close', () => DL_REQS.delete(req));
+  return req;
+}
 function checkDeadline() {
   if (DL_FIRED || (DL_AT && Date.now() > DL_AT)) { const e = new Error('deadline exceeded'); e.fatal = true; throw e; }
 }
@@ -165,6 +166,9 @@ function headersFor(urlStr) {
   } catch {}
   return {};
 }
+// Validators for the running chunked download. Immutable for the run: if a
+// response disagrees, the file was republished and the run must restart.
+let RUN_VALIDATORS = null;
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 function backoffMs(fails) {
   return Math.min(1000 * 2 ** Math.min(fails, 5), 30000) + Math.random() * 1000;
@@ -460,6 +464,7 @@ function requestOnce(urlStr, headers, proxyUrl, depth = 0) {
     });
     req.on('timeout', () => req.destroy(new Error('timeout')));
     req.on('error', reject);
+    trackReq(req);
     req.end();
   });
 }
@@ -539,7 +544,7 @@ function writeAll(fd, buf, pos) {
 // Streaming range download straight into the shared output fd at absolute
 // positions. No part files: received bytes are already correctly placed,
 // so splits and kills never discard or misplace data.
-function downloadRange(url, start, end, fd, proxyUrl, onProgress, token, depth = 0, expectTotal = 0, ifRange = null) {
+function downloadRange(url, start, end, fd, proxyUrl, onProgress, token, depth = 0, expectTotal = 0, ifRange = null, expectValidator = null) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const isHttps = u.protocol === 'https:';
@@ -559,12 +564,12 @@ function downloadRange(url, start, end, fd, proxyUrl, onProgress, token, depth =
       catch (e) { res.resume(); reject(e); return; }
       if (next) {
         res.resume();
-        downloadRange(next, start, end, fd, proxyUrl, onProgress, token, depth + 1, expectTotal, ifRange).then(resolve, reject);
+        downloadRange(next, start, end, fd, proxyUrl, onProgress, token, depth + 1, expectTotal, ifRange, expectValidator).then(resolve, reject);
         return;
       }
       const expected = end - start + 1;
       if (res.statusCode === 412) {
-        res.resume();
+        try { res.destroy(); } catch {}
         const e = new Error('file changed mid-download (If-Range mismatch)');
         e.fatal = true;
         e.code = 'CHANGED';
@@ -572,26 +577,43 @@ function downloadRange(url, start, end, fd, proxyUrl, onProgress, token, depth =
         return;
       }
       if (res.statusCode !== 206) {
-        res.resume();
+        try { res.destroy(); } catch {}
         const e = httpError(res.statusCode, res.headers, `${start}-${end}`);
         if (res.statusCode === 200) {
-          // Per RFC 9110 a weak/mismatched If-Range yields 200, not 412:
-          // the range was ignored, so this attempt's bytes prove nothing.
+          // The range was ignored (weak/missing If-Range yields 200, not 412
+          // per RFC 9110), so this attempt's bytes prove nothing. Handled as
+          // STALE upstream: mirrors get evicted, the direct primary falls
+          // back to single-stream.
           e.message += ' (server ignored Range for chunk)';
           e.rangeInvalid = true;
-          if (ifRange) e.code = 'STALE_RANGE';
+          e.code = 'STALE_RANGE';
         }
         reject(e);
         return;
       }
       const cr = parseContentRange(res.headers['content-range']);
       if (!cr || cr.start !== start || cr.end !== end || (expectTotal > 0 && cr.total !== expectTotal)) {
-        res.resume();
+        try { res.destroy(); } catch {}
         const e = new Error(`Content-Range mismatch for chunk ${start}-${end}: got ${res.headers['content-range'] || 'none'}`);
         e.fatal = true;
         e.rangeInvalid = true;
         reject(e);
         return;
+      }
+      // Version check is primary-only: mirrors legitimately carry their own
+      // ETags. A mismatch means the file was republished mid-download.
+      if (expectValidator) {
+        const re = res.headers.etag;
+        const rm = res.headers['last-modified'];
+        if ((expectValidator.etag && re && re !== expectValidator.etag)
+          || (expectValidator.mtime && rm && rm !== expectValidator.mtime)) {
+          try { res.destroy(); } catch {}
+          const e = new Error('file version changed mid-download (validator mismatch)');
+          e.fatal = true;
+          e.code = 'CHANGED';
+          reject(e);
+          return;
+        }
       }
       let pos = start;
       let received = 0;
@@ -625,6 +647,7 @@ function downloadRange(url, start, end, fd, proxyUrl, onProgress, token, depth =
     timeoutErr.code = 'TIMEOUT';
     req.on('timeout', () => req.destroy(timeoutErr));
     req.on('error', reject);
+    trackReq(req);
     req.end();
   });
 }
@@ -648,7 +671,7 @@ async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0, side
       if (totalSize && start > totalSize) { truncate(); start = 0; }
     } else truncate();
   }
-  if (totalSize && start === totalSize) return; // crashed between rename and receipt: caller verifies
+  if (totalSize && start === totalSize) return 'ok'; // crashed between rename and receipt: caller verifies
   if (start > 0) say(`Resuming single-stream at ${(start / 1048576).toFixed(1)} MB`);
   else writeSidecar();
   let restarts = 0;
@@ -669,7 +692,7 @@ async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0, side
         catch (e) { res.resume(); reject(e); return; }
         if (next) {
           res.resume();
-          downloadSingle(next, outPath, proxyUrl, totalSize, depth + 1, sideKey).then(resolve, reject);
+          downloadSingle(next, outPath, proxyUrl, totalSize, depth + 1, sideKey).then(() => resolve('ok'), reject);
           return;
         }
         if (start > 0 && res.statusCode === 200) {
@@ -731,6 +754,7 @@ async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0, side
     timeoutErr.code = 'TIMEOUT';
     req.on('timeout', () => req.destroy(timeoutErr));
     req.on('error', reject);
+    trackReq(req);
     req.end();
     });
     if (outcome === 'ok') return;
@@ -753,8 +777,10 @@ function benchFetch(urlStr, proxyUrl, maxBytes = 65536, depth = 0) {
     const lib = isHttps ? https : http;
     const benchTimeout = Math.min(TIMEOUT, 10000);
     const req = lib.request(urlStr, {
+      // No custom headers through proxies on plain http: the proxy would see
+      // credentials in the clear. (https targets are CONNECT-tunneled.)
       method: 'GET',
-      headers: { 'User-Agent': 'agent-dla/1.0', ...headersFor(urlStr), Range: `bytes=0-${maxBytes - 1}` },
+      headers: { 'User-Agent': 'agent-dla/1.0', ...(proxyUrl && !isHttps ? {} : headersFor(urlStr)), Range: `bytes=0-${maxBytes - 1}` },
       agent: agentFor(proxyUrl, isHttps, benchTimeout),
       timeout: benchTimeout,
       ...TLS_INSECURE,
@@ -779,6 +805,7 @@ function benchFetch(urlStr, proxyUrl, maxBytes = 65536, depth = 0) {
     });
     req.on('timeout', () => { req.destroy(); done(got); });
     req.on('error', () => done(got));
+    trackReq(req);
     req.end();
   });
 }
@@ -838,13 +865,14 @@ async function sha256File(p) {
 }
 
 // post-download verification; bad output (+manifest/sidecar/receipt) is deleted so a rerun starts clean
-async function verifyOutput(outPath, manifestPath, expectSize = 0) {
+async function verifyOutput(outPath, manifestPath, expectSize = 0, onBad = null) {
   const bytes = fs.existsSync(outPath) ? fs.statSync(outPath).size : 0;
   const bad = async (msg) => {
-    for (const f of [outPath, manifestPath, outPath + '.single.json', outPath.replace(/\.partial$/, '') + '.receipt.json']) {
+    for (const f of [outPath, manifestPath, outPath + '.single.json']) {
       if (!f) continue;
       try { fs.unlinkSync(f); } catch {}
     }
+    if (onBad) { try { await onBad(); } catch {} }
     emit({ event: 'error', scope: 'verify', message: msg });
     throw new Error(msg);
   };
@@ -899,21 +927,34 @@ async function runDownload(targetUrl, retryOpts = {}) {
     }
     usedOutputs.add(resolved);
   }
-  // Completion receipt: proves THIS tool produced this exact file (key covers
+  // Completion receipts live in one hidden per-directory index (not beside
+  // every output): proves THIS tool produced this exact file (key covers
   // origin+path+size+validator, not the query, so refreshed presigned URLs hit).
   const fileKey = manifestKey(originalTarget, info.size, info.etag, info.mtime);
-  const receiptPath = outPath + '.receipt.json';
-  const readReceipt = () => { try { const r = JSON.parse(fs.readFileSync(receiptPath, 'utf8')); return r && typeof r === 'object' ? r : null; } catch { return null; } };
+  const receiptIndexPath = path.join(path.dirname(path.resolve(outPath)), '.agent-dla-receipts.json');
+  const readReceipts = () => { try { const r = JSON.parse(fs.readFileSync(receiptIndexPath, 'utf8')); return r && typeof r === 'object' ? r : {}; } catch { return {}; } };
+  const readReceipt = () => { const r = readReceipts()[path.basename(outPath)]; return r && typeof r === 'object' ? r : null; };
   const writeReceipt = (sha) => {
     try {
-      fs.writeFileSync(receiptPath, JSON.stringify({
+      const idx = readReceipts();
+      idx[path.basename(outPath)] = {
         key: fileKey, url: originalTarget, size: info.size,
         etag: info.etag || null, mtime: info.mtime || null, sha256: sha || null,
-      }));
+      };
+      fs.writeFileSync(receiptIndexPath, JSON.stringify(idx));
+    } catch {}
+  };
+  const dropReceipt = () => {
+    try {
+      const idx = readReceipts();
+      delete idx[path.basename(outPath)];
+      fs.writeFileSync(receiptIndexPath, JSON.stringify(idx));
     } catch {}
   };
   const wipeAll = () => {
-    for (const f of [outPath, outPath + '.partial', outPath + '.manifest.json', outPath + '.single.json', receiptPath]) {
+    dropReceipt();
+    // outPath + '.receipt.json': legacy per-file receipts from older versions.
+    for (const f of [outPath, outPath + '.partial', outPath + '.manifest.json', outPath + '.single.json', outPath + '.receipt.json']) {
       try { fs.unlinkSync(f); } catch {}
     }
   };
@@ -986,24 +1027,36 @@ async function runDownload(targetUrl, retryOpts = {}) {
     warn('-k disables TLS verification, including through proxies (a proxy can intercept TLS) — use --sha256 to be sure of what you got');
   }
   emit({ event: 'start', url: displayUrl(url, true), output: outPath, size: info.size || 0, range: !!info.range, connections: CONNECTIONS, sources: SOURCES.length, proxies: PROXIES.length });
-  // Mirror content check: one small range from each mirror must byte-match
-  // the primary before the mirror serves chunks. Without --sha256 this is
-  // the only defense against a mirror serving plausible-looking garbage.
+  // Mirror content check: samples from the start AND the end of each mirror
+  // must byte-match the primary before the mirror serves chunks. A mirror
+  // serving an entirely wrong file is caught; only --sha256 defends against
+  // subtler poisoning.
   if (info.range && info.size && SOURCES.length > 1) {
-    const cmpEnd = Math.min(1023, info.size - 1);
-    let primarySample = null;
-    for (const via of [null, nextProxy()]) {
-      try {
-        const pr = await requestOnce(url, { Range: `bytes=0-${cmpEnd}` }, via);
-        if (pr.status === 206 && pr.body && pr.body.length === cmpEnd + 1) { primarySample = pr.body; break; }
-      } catch {}
-    }
-    if (primarySample) {
+    const sampleAt = async (base, off) => {
+      const end = Math.min(off + 1023, info.size - 1);
+      for (const via of [null, nextProxy()]) {
+        try {
+          const r = await requestOnce(base, { Range: `bytes=${off}-${end}` }, via);
+          if (r.status === 206 && r.body && r.body.length === end - off + 1) return r.body;
+        } catch {}
+      }
+      return null;
+    };
+    const first = await sampleAt(url, 0);
+    const last = info.size > 2048 ? await sampleAt(url, info.size - 1024) : first;
+    if (first) {
+      const lastOff = info.size > 2048 ? info.size - 1024 : 0;
       for (const m of SOURCES.slice(1)) {
         let okM = false;
         try {
-          const mr = await requestOnce(m, { Range: `bytes=0-${cmpEnd}` }, null);
-          okM = mr.status === 206 && mr.body && mr.body.equals(primarySample);
+          const a = await sampleAt(m, 0);
+          if (a && a.equals(first)) {
+            okM = true;
+            if (lastOff > 0 && last) {
+              const b = await sampleAt(m, lastOff);
+              okM = !!b && b.equals(last);
+            }
+          }
         } catch { okM = false; }
         if (!okM) {
           warn(`mirror failed content check, evicted: ${displayUrl(m, false)}`);
@@ -1043,7 +1096,7 @@ async function runDownload(targetUrl, retryOpts = {}) {
         await sleep(waitMs);
       }
     }
-    const v1 = await verifyOutput(singlePartial, null, info.size);
+    const v1 = await verifyOutput(singlePartial, null, info.size, dropReceipt);
     fs.renameSync(singlePartial, outPath);
     try { fs.unlinkSync(singleSidecar); } catch {}
     writeReceipt(v1.sha);
@@ -1063,6 +1116,7 @@ async function runDownload(targetUrl, retryOpts = {}) {
     return info.mtime || null;
   };
   let PRIMARY_VALIDATOR = pickValidator();
+  RUN_VALIDATORS = (info.etag || info.mtime) ? { etag: info.etag || null, mtime: info.mtime || null } : null;
   const mergeIv = (ivs) => {
     const m = [];
     for (const [a, b] of ivs.slice().sort((x, y) => x[0] - y[0])) {
@@ -1247,9 +1301,18 @@ async function runDownload(targetUrl, retryOpts = {}) {
         e.code = 'CHANGED';
         throw e;
       }
+      const freshValidator = (fresh.etag && !/^W\//i.test(fresh.etag)) ? fresh.etag : (fresh.mtime || null);
+      if ((fresh.etag || null) !== (info.etag || null) || (fresh.mtime || null) !== (info.mtime || null)) {
+        // Republished under the same size: kept bytes belong to the old
+        // version. Restart fresh rather than mix versions.
+        const e = new Error('file republished mid-download (validator changed)');
+        e.fatal = true;
+        e.code = 'CHANGED';
+        throw e;
+      }
       const old = primaryUrl;
       primaryUrl = fresh.finalUrl;
-      PRIMARY_VALIDATOR = (fresh.etag && !/^W\//i.test(fresh.etag)) ? fresh.etag : (fresh.mtime || null);
+      PRIMARY_VALIDATOR = freshValidator;
       for (const j of jobs) { if (j.src === old) j.src = primaryUrl; }
       emit({ event: 'signed-refresh', from: displayUrl(old, true), to: displayUrl(primaryUrl, true) });
       say('Signed link expired, refreshed.');
@@ -1280,7 +1343,7 @@ async function runDownload(targetUrl, retryOpts = {}) {
     };
     for (let a = 0; a < ATTEMPTS; a++) {
       if (a > 0) await sleep(300); // don't hammer back-to-back
-      checkDeadline();
+      try { checkDeadline(); } catch (e) { return { fatal: e }; }
       const proxy = pickProxy();
       const src = pickSrc(job);
       job.src = src;
@@ -1289,7 +1352,7 @@ async function runDownload(targetUrl, retryOpts = {}) {
       inflight.set(job.i, { job, t0: Date.now(), token });
       try {
         job.lastVia = redactProxy(proxy);
-        const got = await downloadRange(src, job.start, job.end, outFd, proxy, track, token, 0, size, src === primaryUrl ? PRIMARY_VALIDATOR : null);
+        const got = await downloadRange(src, job.start, job.end, outFd, proxy, track, token, 0, size, src === primaryUrl ? PRIMARY_VALIDATOR : null, src === primaryUrl ? RUN_VALIDATORS : null);
         finishAttempt(got);
         return true;
       } catch (e) {
@@ -1306,6 +1369,8 @@ async function runDownload(targetUrl, retryOpts = {}) {
         }
         const cls = classifyErr(e);
         if (cls === 'split') return 'split';
+        if (e.code === 'CHANGED') return { fresh: true }; // version changed: wipe and restart
+        if (e.message === 'deadline exceeded') return { fatal: e };
         const direct = isDirectPath(src, proxy);
         const status = e && e.status;
         const path4xx = status >= 400 && status < 500 && status !== 408 && status !== 429;
@@ -1324,7 +1389,7 @@ async function runDownload(targetUrl, retryOpts = {}) {
             try {
               if (await refreshSignedUrl(job)) continue;
             } catch (re) {
-              if (re && re.code === 'CHANGED') return { fatal: re };
+              if (re && re.code === 'CHANGED') return { fresh: true };
             }
           }
           if (path4xx || cls === 'fatal' || e.code === 'ENOTFOUND') continue; // next path, no backoff
@@ -1335,13 +1400,18 @@ async function runDownload(targetUrl, retryOpts = {}) {
           continue;
         }
         if (e.code === 'ENOTFOUND') return { fatal: e };
+        if (e.code === 'CHANGED') return { fresh: true }; // version changed: wipe and restart
+        if (e.message === 'deadline exceeded') return { fatal: e };
         if (e.code === 'STALE_RANGE') return { stale: true }; // range ignored: single-stream fallback
         if ((status === 401 || status === 403 || status === 410) && primaryUrl !== originalTarget) {
           try {
             if (await refreshSignedUrl(job)) return false; // requeue with the fresh link
           } catch (re) {
-            if (re && re.code === 'CHANGED') return { fatal: re };
+            if (re && re.code === 'CHANGED') return { fresh: true };
           }
+          // Refresh failed transiently (outage): requeue with backoff rather
+          // than aborting. Bounded by MAX_RETRIES and the deadline.
+          return false;
         }
         if (cls === 'fatal' || path4xx) return { fatal: e };
         if (cls === 'throttle' && e.retryAfter > 0) {
@@ -1356,7 +1426,7 @@ async function runDownload(targetUrl, retryOpts = {}) {
     inflight.set(job.i, { job, t0: Date.now(), token });
     try {
       job.lastVia = 'direct';
-      const got = await downloadRange(primaryUrl, job.start, job.end, outFd, null, track, token, 0, size, PRIMARY_VALIDATOR);
+      const got = await downloadRange(primaryUrl, job.start, job.end, outFd, null, track, token, 0, size, PRIMARY_VALIDATOR, RUN_VALIDATORS);
       finishAttempt(got);
       return true;
     } catch (e) {
@@ -1370,14 +1440,19 @@ async function runDownload(targetUrl, retryOpts = {}) {
       }
       const cls = classifyErr(e);
       if (cls === 'split') return 'split';
+      if (e.code === 'CHANGED') return { fresh: true }; // version changed: wipe and restart
+      if (e.message === 'deadline exceeded') return { fatal: e };
       if (cls === 'fatal' || e.code === 'ENOTFOUND') {
         const status = e && e.status;
         if ((status === 401 || status === 403 || status === 410) && primaryUrl !== originalTarget) {
           try {
             if (await refreshSignedUrl(job)) return false;
           } catch (re) {
-            if (re && re.code === 'CHANGED') return { fatal: re };
+            if (re && re.code === 'CHANGED') return { fresh: true };
           }
+          // Refresh failed transiently (outage): requeue with backoff rather
+          // than aborting. Bounded by MAX_RETRIES and the deadline.
+          return false;
         }
         return { fatal: e };
       }
@@ -1392,6 +1467,7 @@ async function runDownload(targetUrl, retryOpts = {}) {
   splitBudget = jobs.length * 2;
   let fatal = null;
   let staleRestart = false;
+  let freshRestart = false;
   let down = false;
   shutdownHandler = async (sig) => {
     if (down) return;
@@ -1410,7 +1486,7 @@ async function runDownload(targetUrl, retryOpts = {}) {
   const workers = Array.from({ length: CONC }, async () => {
     while (true) {
       const j = queue.shift();
-      if (!j) { if (pending === 0 || fatal || down) return; await sleep(500); continue; }
+      if (!j) { if (pending === 0 || fatal || staleRestart || freshRestart || down) return; await sleep(500); continue; }
       const r = await runJob(j);
       if (down) return;
       if (r === true) { pending--; continue; }
@@ -1418,24 +1494,38 @@ async function runDownload(targetUrl, retryOpts = {}) {
       if (r && r.stale) {
         staleRestart = true;
         pending = 0;
+        queue.length = 0;
+        return;
+      }
+      if (r && r.fresh) {
+        freshRestart = true;
+        pending = 0;
+        queue.length = 0;
         return;
       }
       if (r && r.fatal) {
         fatal = new Error(`chunk ${j.i} unrecoverable: ${r.fatal.message} (progress kept in ${partialPath} + manifest, rerun resumes what completed)`);
         pending = 0;
+        queue.length = 0;
         return;
       }
       j.fails = (j.fails || 0) + 1;
       totalRetries++;
-      checkDeadline();
+      try { checkDeadline(); } catch (e) {
+        fatal = e;
+        pending = 0;
+        queue.length = 0;
+        return;
+      }
       emit({ event: 'retry', scope: 'chunk', chunk: j.i, fails: j.fails, after_ms: Math.round(backoffMs(j.fails)) });
       if (j.fails > MAX_RETRIES) {
         fatal = new Error(`chunk ${j.i} failed ${MAX_RETRIES}x (progress kept in ${partialPath} + manifest, rerun to resume)`);
         pending = 0;
+        queue.length = 0;
         return;
       }
       await backoff(j.fails);
-      if (fatal || down) return;
+      if (fatal || staleRestart || freshRestart || down) return;
       queue.push(j);
     }
   });
@@ -1445,6 +1535,14 @@ async function runDownload(targetUrl, retryOpts = {}) {
   clearInterval(manifestTimer);
   try { fs.closeSync(outFd); } catch {}
   if (fatal) throw fatal;
+  if (freshRestart) {
+    // The file was republished mid-download: kept bytes belong to the old
+    // version. Wipe everything and redo the file with a fresh probe.
+    try { fs.unlinkSync(partialPath); } catch {}
+    try { fs.unlinkSync(manifestPath); } catch {}
+    if (staleDepth < 2) return runDownload(targetUrl, { staleDepth: staleDepth + 1, isRetry: true });
+    throw new Error('file changed repeatedly mid-download, aborting');
+  }
   if (staleRestart) {
     // The server stopped honoring Range mid-run: wipe the chunked state and
     // redo this file as a single stream (which tolerates 200s).
@@ -1462,7 +1560,7 @@ async function runDownload(targetUrl, retryOpts = {}) {
     });
   }
   say('Verifying...');
-  const v = await verifyOutput(partialPath, manifestPath, size);
+  const v = await verifyOutput(partialPath, manifestPath, size, dropReceipt);
   fs.renameSync(partialPath, outPath);
   try { fs.unlinkSync(manifestPath); } catch {}
   writeReceipt(v.sha);
@@ -1493,7 +1591,12 @@ async function runDownload(targetUrl, retryOpts = {}) {
     DL_AT = DEADLINE_MS > 0 ? Date.now() + DEADLINE_MS : 0;
     DL_FIRED = false;
     if (dlTimer) { clearTimeout(dlTimer); dlTimer = null; }
-    if (DEADLINE_MS > 0) dlTimer = setTimeout(() => { DL_FIRED = true; }, DEADLINE_MS);
+    if (DEADLINE_MS > 0) {
+      dlTimer = setTimeout(() => {
+        DL_FIRED = true;
+        for (const r of DL_REQS) { try { r.destroy(deadlineErr()); } catch {} }
+      }, DEADLINE_MS);
+    }
     if (!validTarget(t)) {
       const msg = 'skipping invalid URL (want http(s))';
       failed.push(displayUrl(t, true));

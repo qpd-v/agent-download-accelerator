@@ -131,9 +131,11 @@ describe('reliability', () => {
     const buf = crypto.randomBytes(40 * MB);
     const hash = crypto.createHash('sha256').update(buf).digest('hex');
     let served = 0;
+    const ranges = [];
     const s = require('http').createServer((q, res) => {
       const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
       const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : buf.length - 1;
+      if (m) ranges.push([a, b]);
       res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${buf.length}` } : {}) });
       let off = a;
       const tick = () => {
@@ -161,12 +163,35 @@ describe('reliability', () => {
       const kept = (m.done || []).reduce((t, [s2, e]) => t + (e - s2 + 1), 0)
         + Object.values(m.active || {}).reduce((t, [s2, x]) => t + Math.max(0, x - s2), 0);
       assert.ok(kept > 0, 'manifest records transferred bytes');
-      const run1 = served;
       served = 0;
+      ranges.length = 0;
       const r = await H.runAccel([fileUrl, '-o', out, '-n', '4', '--json'], { cwd: work });
       assert.equal(r.code, 0);
       assert.equal(H.sha256(out), hash);
       assert.ok(served < 40 * MB - kept / 2, `rerun transferred less (${(served / MB).toFixed(1)}MB of 40MB, kept ${(kept / MB).toFixed(1)}MB)`);
+      // Deterministic invariant (immune to timing flakiness): every byte the
+      // rerun requested outside the 1-byte probe was missing per the manifest.
+      const ivs = [...(m.done || []), ...Object.values(m.active || {})
+        .filter((a) => Array.isArray(a) && a[1] > a[0]).map(([s, x]) => [s, x - 1])];
+      ivs.sort((a, b) => a[0] - b[0]);
+      const merged = [];
+      for (const [a, b] of ivs) {
+        const l = merged[merged.length - 1];
+        if (l && a <= l[1] + 1) l[1] = Math.max(l[1], b);
+        else merged.push([a, b]);
+      }
+      const gaps = [];
+      let cur = 0;
+      for (const [s, e] of merged) {
+        if (s > cur) gaps.push([cur, s - 1]);
+        cur = Math.max(cur, e + 1);
+      }
+      if (cur < 40 * MB) gaps.push([cur, 40 * MB - 1]);
+      for (const [a, b] of ranges) {
+        if (a === 0 && b === 0) continue; // probe
+        assert.ok(gaps.some(([s, e]) => s <= a && b <= e),
+          `rerun requested [${a}, ${b}], outside manifest gaps`);
+      }
     } finally {
       s.close();
     }
@@ -282,7 +307,7 @@ describe('reliability', () => {
     const crypto = require('crypto');
     const buf = crypto.randomBytes(2 * MB);
     const hash = crypto.createHash('sha256').update(buf).digest('hex');
-    const seen1 = [], seen2 = [];
+    const seen1 = [], seen2 = [], seenPx = [];
     const s2 = require('http').createServer((q, res) => {
       seen2.push(q.headers['x-token'] || null);
       const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
@@ -298,16 +323,27 @@ describe('reliability', () => {
       res.writeHead(302, { Location: url2 }); res.end();
     });
     await new Promise((ok) => s1.listen(0, '127.0.0.1', ok));
+    // recording forward proxy: the bench path must not hand it the token either
+    const px = await H.startForwardProxy((clientReq, clientRes) => {
+      seenPx.push(clientReq.headers['x-token'] || null);
+      const t = new URL(clientReq.url);
+      const preq = http.request({ host: t.hostname, port: t.port, path: t.pathname + t.search, method: 'GET', headers: { range: clientReq.headers.range } }, (r) => { clientRes.writeHead(r.statusCode, r.headers); r.pipe(clientRes); });
+      preq.on('error', () => { try { clientRes.writeHead(502); clientRes.end(); } catch {} });
+      preq.end();
+    });
     try {
+      fs.writeFileSync(path.join(work, 'proxies.txt'), `http://127.0.0.1:${px.port}\n`);
       const out = path.join(work, 'o.bin');
-      const r = await H.runAccel([`http://127.0.0.1:${s1.address().port}/file`, '-o', out, '-n', '4', '--json', '--header', 'X-Token: s3cr3t'], { cwd: work });
+      const r = await H.runAccel([`http://127.0.0.1:${s1.address().port}/file`, '-o', out, '-n', '4', '--json', '--header', 'X-Token: s3cr3t', '--no-auto-refresh'], { cwd: work });
       assert.equal(r.code, 0);
       assert.equal(H.sha256(out), hash);
       assert.ok(seen1.length > 0 && seen1.every((v) => v === 's3cr3t'), 'origin got the token');
       assert.ok(seen2.length > 0 && seen2.every((v) => v === null || v === undefined), 'redirect target never saw the token');
+      assert.ok(seenPx.length > 0 && seenPx.every((v) => v === null || v === undefined), 'bench via proxy never saw the token');
     } finally {
       s1.close();
       s2.close();
+      px.close();
     }
   });
 
@@ -454,6 +490,213 @@ describe('reliability', () => {
       assert.ok(fs.readFileSync(out).equals(buf), 'output equals the server file exactly');
     } finally {
       s.close();
+    }
+  });
+
+  it('--deadline in batch mode stops file 1 before file 2 starts', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-batchdeadline');
+    const hits1 = [], hits2 = [];
+    const slow = require('http').createServer((q, res) => {
+      hits1.push(Date.now());
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : 32 * MB - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${32 * MB}` } : {}) });
+      let off = a;
+      const tick = () => {
+        if (res.destroyed) return;
+        const n = Math.min(64 * 1024, b - off + 1);
+        res.write(Buffer.alloc(n, 7));
+        off += n;
+        if (off > b) res.end();
+        else setTimeout(tick, 200);
+      };
+      tick();
+    });
+    await new Promise((ok) => slow.listen(0, '127.0.0.1', ok));
+    const fastBuf = crypto.randomBytes(1 * MB);
+    const fast = require('http').createServer((q, res) => {
+      hits2.push(Date.now());
+      res.writeHead(200, { 'Content-Length': fastBuf.length });
+      res.end(fastBuf);
+    });
+    await new Promise((ok) => fast.listen(0, '127.0.0.1', ok));
+    try {
+      fs.writeFileSync(path.join(work, 'list.txt'),
+        `http://127.0.0.1:${slow.address().port}/slow.bin\nhttp://127.0.0.1:${fast.address().port}/fast.bin\n`);
+      const r = await H.runAccel(['--list', 'list.txt', '--json', '--deadline', '3000'], { cwd: work });
+      assert.equal(r.code, 1, 'file 1 fails, file 2 completes');
+      const ev = H.events(r.stdout);
+      assert.ok(ev.some((e) => e.event === 'error' && /deadline/.test(e.message || '')), 'deadline error reported');
+      assert.ok(ev.some((e) => e.event === 'done' && !e.cached), 'file 2 completed');
+      assert.ok(hits1.length > 0 && hits2.length > 0);
+      assert.ok(Math.max(...hits1) < Math.min(...hits2), 'no file-1 requests after file 2 started');
+    } finally {
+      slow.close();
+      fast.close();
+    }
+  });
+
+  it('stale fallback does not drain full bodies (bandwidth bounded)', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-stalebw');
+    const buf = crypto.randomBytes(4 * MB);
+    let served = 0;
+    let rangeReqs = 0;
+    const s = require('http').createServer((q, res) => {
+      const w = res.write.bind(res);
+      const e = res.end.bind(res);
+      const live = () => !res.destroyed && !q.socket.destroyed;
+      // paced drip: bytes only count if the client is still listening,
+      // so destroying a response actually saves bandwidth
+      const drip = (data) => {
+        let off = 0;
+        res.on('error', () => {});
+        const tick = () => {
+          if (!live()) return;
+          const n = Math.min(64 * 1024, data.length - off);
+          if (n > 0) { served += n; w(data.subarray(off, off + n)); off += n; }
+          if (off >= data.length) { if (live()) e(); }
+          else setTimeout(tick, 50);
+        };
+        tick();
+      };
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      if (m && +m[1] === 0 && +m[2] === 0) {
+        res.writeHead(206, { 'Content-Range': `bytes 0-0/${buf.length}`, 'Content-Length': 1 });
+        res.end(buf.subarray(0, 1));
+        return;
+      }
+      rangeReqs++;
+      if (rangeReqs <= 2) {
+        const a = +m[1], b = +m[2];
+        res.writeHead(206, { 'Content-Length': b - a + 1, 'Content-Range': `bytes ${a}-${b}/${buf.length}` });
+        drip(buf.subarray(a, b + 1));
+        return;
+      }
+      // server "changed": ignores Range, full 200 body (destroyed at headers)
+      res.writeHead(200, { 'Content-Length': buf.length });
+      drip(buf);
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'o.bin');
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/f.bin`, '-o', out, '-n', '4', '--json'], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.equal(H.sha256(out), crypto.createHash('sha256').update(buf).digest('hex'));
+      assert.ok(served <= 2 * buf.length, `transferred ${served} for a ${buf.length} file (stale drain bounded)`);
+    } finally {
+      s.close();
+    }
+  });
+
+  it('single-stream follows redirects on the final URL', { timeout: 60000 }, async () => {
+    const work = H.workdir('rel-singleredirect');
+    const buf = crypto.randomBytes(1 * MB);
+    const s = require('http').createServer((q, res) => {
+      if (q.url === '/start') { res.writeHead(302, { Location: '/cdn/file' }); res.end(); return; }
+      res.writeHead(200, { 'Content-Length': buf.length });
+      res.end(buf);
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'o.bin');
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/start`, '-o', out, '-n', '1', '--json'], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.ok(fs.readFileSync(out).equals(buf));
+    } finally {
+      s.close();
+    }
+  });
+
+  it('republished same-size file restarts clean with the new version', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-republish');
+    const crypto2 = require('crypto');
+    const v1 = crypto2.randomBytes(4 * MB);
+    const v2 = crypto2.randomBytes(4 * MB);
+    const h2 = crypto2.createHash('sha256').update(v2).digest('hex');
+    const t0 = Date.now();
+    const flipAt = t0 + 1200;
+    const servePaced = (res, data, a, b, destroyAt) => {
+      let off = a;
+      const tick = () => {
+        if (res.destroyed) return;
+        if (destroyAt && Date.now() > destroyAt) { try { res.destroy(); } catch {} return; }
+        const n = Math.min(64 * 1024, b - off + 1);
+        res.write(data.subarray(off, off + n));
+        off += n;
+        if (off > b) res.end();
+        else setTimeout(tick, 250); // ~256KB/s: chunks stay in flight for seconds
+      };
+      tick();
+    };
+    const s = require('http').createServer((q, res) => {
+      const u = new URL(q.url, 'http://x');
+      const cur = Date.now() > flipAt ? v2 : v1;
+      const etag = Date.now() > flipAt ? '"v2"' : '"v1"';
+      if (u.pathname === '/release') {
+        res.writeHead(302, { Location: `/signed?exp=${Date.now() + 1500}` });
+        res.end();
+        return;
+      }
+      if (Date.now() > +u.searchParams.get('exp')) { res.writeHead(403); res.end('expired'); return; }
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : cur.length - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ETag: etag, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${cur.length}` } : {}) });
+      // one chunk gets cut off after expiry, forcing a refresh onto v2
+      const killAt = (a === 2 * MB && etag === '"v1"') ? t0 + 2000 : 0;
+      servePaced(res, cur, a, b, killAt);
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'o.bin');
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/release`, '-o', out, '-n', '4', '--json'], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.equal(H.sha256(out), h2, 'output is the new version, not a mix');
+    } finally {
+      s.close();
+    }
+  });
+
+  it('--max-retries 0 issues exactly one round of chunk attempts', { timeout: 60000 }, async () => {
+    const work = H.workdir('rel-maxr0count');
+    let chunkHits = 0;
+    const s = require('http').createServer((q, res) => {
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      if (m && +m[1] === 0 && +m[2] === 0) {
+        res.writeHead(206, { 'Content-Range': 'bytes 0-0/1000', 'Content-Length': 1 });
+        res.end('A');
+        return;
+      }
+      if (m) { chunkHits++; res.writeHead(500); res.end('boom'); return; }
+      res.writeHead(200, { 'Content-Length': 1000, 'Accept-Ranges': 'bytes' });
+      res.end(Buffer.alloc(1000, 1));
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/f`, '-o', path.join(work, 'o.bin'), '-n', '2', '--json', '--max-retries', '0'], { cwd: work });
+      assert.equal(r.code, 1);
+      assert.equal(chunkHits, 4, 'one attempt + one last-resort per chunk, then stop');
+    } finally {
+      s.close();
+    }
+  });
+
+  it('mirror differing only at the end is evicted by the tail sample', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-eviltail');
+    const src = H.makeFile(work, 'src.bin', 2 * MB);
+    const buf = fs.readFileSync(src.path);
+    const evil = Buffer.from(buf);
+    evil[evil.length - 100] ^= 0xff;
+    const srv = await H.startServer({ '/f.bin': { buf, tmp: path.join(work, 'srv.tmp') } });
+    const msrv = await H.startServer({ '/f.bin': { buf: evil, tmp: path.join(work, 'srv2.tmp') } });
+    try {
+      const out = path.join(work, 'o.bin');
+      const r = await H.runAccel([srv.url('/f.bin'), '--mirror', msrv.url('/f.bin'), '-o', out, '-n', '4', '--json'], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.equal(H.sha256(out), src.hash);
+      assert.match(r.stderr, /content check, evicted/);
+    } finally {
+      await srv.close();
+      await msrv.close();
     }
   });
 });

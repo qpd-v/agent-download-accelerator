@@ -84,11 +84,12 @@ strings, and fragments; `--redact` extends that to human logs.
   `--overwrite` is given (`--overwrite` truncates; resume needs a sidecar or
   manifest proving this tool made the partial). Batch collisions get unique
   `(1)` suffixed names.
-- A finished download writes a receipt; reruns trust size+receipt (or
-  `--sha256`), never size alone. Resume identity ignores URL query strings
-  so refreshed presigned URLs resume the same file.
-- Each mirror must byte-match a 1KB sample of the primary before serving
-  chunks; mismatches are evicted (warns without `--sha256`).
+- A finished download writes a receipt to a hidden per-directory index;
+  reruns trust size+receipt (or `--sha256`), never size alone. Resume identity
+  ignores URL query strings so refreshed presigned URLs resume the same file.
+  A republished file (validator change) restarts clean instead of mixing versions.
+- Each mirror must byte-match first- and last-1KB samples of the primary
+  before serving chunks; mismatches are evicted (warns without `--sha256`).
 - `--list` lines must be valid http(s) URLs or they are skipped without retries.
 - Probing has its own small budget; DNS and local filesystem errors fail fast.
   `--deadline` cancels in-flight requests, it doesn't just stop new attempts.
