@@ -866,18 +866,188 @@ describe('reliability', () => {
     }
   });
 
-  it('corrupt receipt index leads to re-download, not refusal', { timeout: 120000 }, async () => {
+  it('corrupt per-file receipt with -o re-downloads cleanly', { timeout: 120000 }, async () => {
     const work = H.workdir('rel-receiptcorrupt');
     const src = H.makeFile(work, 'src.bin', 1 * MB);
     const srv = await H.startServer({ '/f.bin': { buf: fs.readFileSync(src.path), tmp: path.join(work, 'srv.tmp') } });
     try {
-      const r1 = await H.runAccel([srv.url('/f.bin'), '--json'], { cwd: work });
+      const out = path.join(work, 'o.bin');
+      const r1 = await H.runAccel([srv.url('/f.bin'), '-o', out, '--json'], { cwd: work });
       assert.equal(r1.code, 0);
-      fs.writeFileSync(path.join(work, '.agent-dla-receipts.json'), '{corrupt!!!');
-      const r = await H.runAccel([srv.url('/f.bin'), '--json'], { cwd: work });
+      // corrupt just this file's receipt (per-file store, not a shared index)
+      fs.writeFileSync(path.join(work, '.agent-dla', 'receipts', 'o.bin.json'), '{corrupt!!!');
+      const r = await H.runAccel([srv.url('/f.bin'), '-o', out, '--json'], { cwd: work });
       assert.equal(r.code, 0);
-      assert.equal(H.sha256(path.join(work, 'f.bin')), src.hash);
+      assert.equal(H.sha256(out), src.hash);
     } finally {
+      await srv.close();
+    }
+  });
+
+  it('corrupt per-file receipt without -o is refused, siblings stay cached', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-receiptsiblings');
+    const src1 = H.makeFile(work, 'src1.bin', 1 * MB);
+    const src2 = H.makeFile(work, 'src2.bin', 1 * MB);
+    const srv = await H.startServer({
+      '/f1.bin': { buf: fs.readFileSync(src1.path), tmp: path.join(work, 'srv1.tmp') },
+      '/f2.bin': { buf: fs.readFileSync(src2.path), tmp: path.join(work, 'srv2.tmp') },
+    });
+    try {
+      const r1 = await H.runAccel([srv.url('/f1.bin'), '--json'], { cwd: work });
+      const r2 = await H.runAccel([srv.url('/f2.bin'), '--json'], { cwd: work });
+      assert.equal(r1.code, 0);
+      assert.equal(r2.code, 0);
+      // corrupt only f1's receipt
+      fs.writeFileSync(path.join(work, '.agent-dla', 'receipts', 'f1.bin.json'), '{corrupt!!!');
+      const rr1 = await H.runAccel([srv.url('/f1.bin'), '--json'], { cwd: work });
+      assert.equal(rr1.code, 1, 'corrupt receipt without -o must refuse, not overwrite');
+      assert.match(rr1.stdout + rr1.stderr, /--overwrite/);
+      const rr2 = await H.runAccel([srv.url('/f2.bin'), '--json'], { cwd: work });
+      assert.equal(rr2.code, 0);
+      assert.ok(H.events(rr2.stdout).some((e) => e.event === 'done' && e.cached === true), 'sibling stays cached');
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('no receipt never overwrites an unrelated same-size file', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-receiptclobber');
+    const src = H.makeFile(work, 'src.bin', 1 * MB);
+    const srv = await H.startServer({ '/f.bin': { buf: fs.readFileSync(src.path), tmp: path.join(work, 'srv.tmp') } });
+    try {
+      const victim = path.join(work, 'f.bin');
+      const stranger = crypto.randomBytes(1 * MB);
+      fs.writeFileSync(victim, stranger);
+      const r = await H.runAccel([srv.url('/f.bin'), '--json'], { cwd: work });
+      assert.equal(r.code, 1);
+      assert.match(r.stdout + r.stderr, /--overwrite/);
+      assert.equal(fs.readFileSync(victim).toString('hex'), stranger.toString('hex'), 'unrelated file untouched');
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('parallel downloads keep all receipts, reruns cached', { timeout: 180000 }, async () => {
+    const work = H.workdir('rel-parallel-receipts');
+    const files = {};
+    const srcs = [];
+    for (let i = 0; i < 8; i++) {
+      const s = H.makeFile(work, `src${i}.bin`, 1 * MB);
+      srcs.push(s);
+      files[`/f${i}.bin`] = { buf: fs.readFileSync(s.path), tmp: path.join(work, `srv${i}.tmp`) };
+    }
+    const srv = await H.startServer(files);
+    try {
+      const outs = srcs.map((_, i) => path.join(work, `o${i}.bin`));
+      const first = await Promise.all(outs.map((out, i) =>
+        H.runAccel([srv.url(`/f${i}.bin`), '-o', out, '-n', '2', '--json'], { cwd: work })));
+      for (const r of first) assert.equal(r.code, 0);
+      for (let i = 0; i < 8; i++) assert.equal(H.sha256(outs[i]), srcs[i].hash);
+      const second = await Promise.all(outs.map((out, i) =>
+        H.runAccel([srv.url(`/f${i}.bin`), '-o', out, '-n', '2', '--json'], { cwd: work })));
+      for (const r of second) {
+        assert.equal(r.code, 0);
+        assert.ok(H.events(r.stdout).some((e) => e.event === 'done' && e.cached === true), 'rerun cached');
+      }
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('strict If-Range server resumes single-stream without restart', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-strict-ifrange');
+    const buf = crypto.randomBytes(4 * MB);
+    const hash = crypto.createHash('sha256').update(buf).digest('hex');
+    const ETAG = '"strict1"';
+    let seenIfRange = null;
+    let droppedOnce = false;
+    let wireBytes = 0;
+    const s = require('http').createServer((q, res) => {
+      const ir = q.headers['if-range'];
+      const range = q.headers.range || '';
+      const m = /bytes=(\d+)-(\d*)/.exec(range);
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : buf.length - 1;
+      if (range === 'bytes=0-0') {
+        // probe: always succeed, never drop
+        res.writeHead(206, { 'Content-Length': 1, 'Content-Range': `bytes 0-0/${buf.length}`, ETag: ETAG });
+        res.end(buf.subarray(0, 1));
+        return;
+      }
+      if (!droppedOnce) {
+        // first download attempt (single-stream 200, no Range): send 1MB then kill
+        droppedOnce = true;
+        res.writeHead(m ? 206 : 200, { 'Content-Length': buf.length - a, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${buf.length}` } : {}), ETag: ETAG });
+        res.write(buf.subarray(a, a + 1 * MB));
+        wireBytes += 1 * MB;
+        setTimeout(() => { try { q.socket.destroy(); } catch {} }, 100);
+        return;
+      }
+      if (m) {
+        seenIfRange = ir || null;
+        if (ir !== ETAG) {
+          // strict server: unrecognized If-Range -> full 200, resume becomes restart
+          res.writeHead(200, { 'Content-Length': buf.length, ETag: ETAG });
+          wireBytes += buf.length;
+          res.end(buf);
+          return;
+        }
+        res.writeHead(206, { 'Content-Length': b - a + 1, 'Content-Range': `bytes ${a}-${b}/${buf.length}`, ETag: ETAG });
+        wireBytes += b - a + 1;
+        res.end(buf.subarray(a, b + 1));
+        return;
+      }
+      res.writeHead(200, { 'Content-Length': buf.length, ETag: ETAG });
+      wireBytes += buf.length;
+      res.end(buf);
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'o.bin');
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/f.bin`, '-o', out, '-n', '1', '--json'], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.equal(H.sha256(out), hash);
+      assert.equal(seenIfRange, ETAG, 'If-Range carries the strong ETag, not [object Object]');
+      assert.ok(wireBytes < buf.length * 1.2, `resumed, not restarted (wire ${wireBytes} < ${Math.round(buf.length * 1.2)})`);
+    } finally {
+      s.close();
+    }
+  });
+
+  it('URL credentials never reach a plain-http proxy', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-userinfo-proxy');
+    const src = H.makeFile(work, 'src.bin', 1 * MB);
+    const srv = await H.startServer({ '/f.bin': { buf: fs.readFileSync(src.path), tmp: path.join(work, 'srv.tmp') } });
+    let sawAuth = 0, total = 0;
+    const proxy = http.createServer((clientReq, clientRes) => {
+      total++;
+      if (clientReq.headers.authorization) sawAuth++;
+      let target;
+      try { target = new URL(clientReq.url); } catch { clientRes.writeHead(400); clientRes.end(); return; }
+      const headers = { ...clientReq.headers };
+      delete headers['proxy-authorization'];
+      delete headers['proxy-connection'];
+      delete headers.authorization; // must not forward what we must not have seen
+      headers.host = target.host;
+      const preq = http.request(
+        { host: target.hostname, port: target.port || 80, path: target.pathname + target.search, method: clientReq.method, headers },
+        (pres) => { clientRes.writeHead(pres.statusCode, pres.headers); pres.pipe(clientRes); },
+      );
+      preq.on('error', () => { try { clientRes.writeHead(502); clientRes.end(); } catch {} });
+      clientReq.pipe(preq);
+    });
+    await new Promise((ok) => proxy.listen(0, '127.0.0.1', ok));
+    try {
+      const authed = srv.url('/f.bin').replace('http://', 'http://user:pw@');
+      const out = path.join(work, 'o.bin');
+      const r = await H.runAccel([authed, '-o', out, '-n', '2', '--json', '--no-auto-refresh',
+        '-p', (() => { const f = path.join(work, 'proxies.txt'); fs.writeFileSync(f, `http://127.0.0.1:${proxy.address().port}\n`); return f; })(),
+      ], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.equal(H.sha256(out), src.hash);
+      assert.ok(total > 0, 'proxy saw traffic');
+      assert.equal(sawAuth, 0, 'proxy never saw Authorization');
+    } finally {
+      proxy.close();
       await srv.close();
     }
   });

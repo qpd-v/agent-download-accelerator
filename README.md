@@ -81,14 +81,20 @@ strings, and fragments; `--redact` extends that to human logs.
   single-stream, repeated validator flapping falls back as well — resumed
   bytes are never mixed across versions.
 - Redirects are capped at 10 hops, non-HTTP targets and https-to-http
-  downgrades refused. `--header` values only go to the original URL's origin.
+  downgrades refused. `--header` values only go to the original URL's origin,
+  and are withheld from plain-http proxy requests (as are URL-embedded
+  credentials `http://user:pw@host`, with a warning) — a proxy would see them
+  in the clear.
 - Server-chosen filenames are sanitized (no traversal, no dotfiles, no
   tool-file collisions) and never overwrite an existing file unless `-o` or
   `--overwrite` is given (`--overwrite` truncates; resume needs a sidecar or
   manifest proving this tool made the partial). Batch collisions get unique
   `(1)` suffixed names.
-- A finished download writes a receipt to a hidden per-directory index;
-  reruns trust size+receipt (or `--sha256`), never size alone. Resume identity
+- A finished download writes a receipt to a hidden per-directory store
+  (`.agent-dla/receipts/<name>.json`, one file per output, atomic writes);
+  reruns trust size+receipt (or `--sha256`), never size alone. Parallel runs
+  into one directory are safe; a corrupt receipt affects only its own file.
+  Resume identity
   ignores URL query strings so refreshed presigned URLs resume the same file.
   A republished file (validator change) restarts clean instead of mixing versions.
 - Each mirror must byte-match first- and last-1KB samples of the primary

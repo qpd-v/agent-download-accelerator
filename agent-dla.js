@@ -221,6 +221,25 @@ function displayUrl(u, forJson) {
     return x.toString();
   } catch { return (forJson || opts.redact) ? '[unparseable-url]' : String(u); }
 }
+// URL userinfo (http://user:pw@host) becomes an Authorization header on the
+// wire. Through a plain-http proxy that header is visible to the proxy, so
+// strip it there (https is CONNECT-tunneled; direct keeps working).
+let warnedUserinfo = false;
+function requestUrlFor(urlStr, proxyUrl) {
+  if (!proxyUrl) return urlStr;
+  try {
+    const u = new URL(String(urlStr));
+    if (u.protocol !== 'http:') return urlStr;
+    if (!u.username && !u.password) return urlStr;
+    if (!warnedUserinfo) {
+      warnedUserinfo = true;
+      warn('URL credentials are withheld from plain-http proxy requests (a proxy would see them); use https or a direct connection for authenticated URLs');
+    }
+    u.username = '';
+    u.password = '';
+    return u.toString();
+  } catch { return urlStr; }
+}
 function validTarget(t) {
   try {
     const u = new URL(String(t));
@@ -452,7 +471,9 @@ function requestOnce(urlStr, headers, proxyUrl, depth = 0) {
     const agent = agentFor(proxyUrl, isHttps);
     // No custom headers through proxies on plain http: the proxy would see
     // credentials in the clear. (https targets are CONNECT-tunneled.)
-    const req = lib.request(urlStr, {
+    // Same for URL userinfo: strip it so the proxy never sees Authorization.
+    const reqUrl = requestUrlFor(urlStr, proxyUrl);
+    const req = lib.request(reqUrl, {
       method: 'GET',
       headers: { 'User-Agent': 'agent-dla/1.0', ...(proxyUrl && !isHttps ? {} : headersFor(urlStr)), ...headers },
       agent,
@@ -460,7 +481,7 @@ function requestOnce(urlStr, headers, proxyUrl, depth = 0) {
       ...TLS_INSECURE,
     }, (res) => {
       let next = null;
-      try { next = redirectTarget(res, urlStr, depth); }
+      try { next = redirectTarget(res, reqUrl, depth); }
       catch (e) { res.resume(); reject(e); return; }
       if (next) {
         res.resume();
@@ -472,7 +493,7 @@ function requestOnce(urlStr, headers, proxyUrl, depth = 0) {
       const chunks = [];
       let buffered = 0;
       let settled = false;
-      const finish = (body) => { if (!settled) { settled = true; resolve({ status: res.statusCode, headers: res.headers, body, finalUrl: urlStr }); } };
+      const finish = (body) => { if (!settled) { settled = true; resolve({ status: res.statusCode, headers: res.headers, body, finalUrl: reqUrl }); } };
       res.on('data', (c) => {
         buffered += c.length;
         if (buffered <= 262144) chunks.push(c);
@@ -572,7 +593,8 @@ function downloadRange(url, start, end, fd, proxyUrl, onProgress, token, depth =
     const agent = agentFor(proxyUrl, isHttps);
     const rangeHeaders = { 'User-Agent': 'agent-dla/1.0', ...(proxyUrl && !isHttps ? {} : headersFor(url)), Range: `bytes=${start}-${end}` };
     if (ifRange) rangeHeaders['If-Range'] = ifRange;
-    const req = lib.request(url, {
+    const reqUrl = requestUrlFor(url, proxyUrl);
+    const req = lib.request(reqUrl, {
       method: 'GET',
       headers: rangeHeaders,
       agent,
@@ -580,7 +602,7 @@ function downloadRange(url, start, end, fd, proxyUrl, onProgress, token, depth =
       ...TLS_INSECURE,
     }, (res) => {
       let next = null;
-      try { next = redirectTarget(res, url, depth); }
+      try { next = redirectTarget(res, reqUrl, depth); }
       catch (e) { res.resume(); reject(e); return; }
       if (next) {
         res.resume();
@@ -700,9 +722,11 @@ async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0, side
     const outcome = await new Promise((resolve, reject) => {
       // Resume is conditional on the file being unchanged: If-Range plus a
       // validator comparison, so a republished file can't silently mix in.
+      // If-Range is a single validator (ETag or date), never the object.
       const resumeHeaders = { 'User-Agent': 'agent-dla/1.0', ...(proxyUrl && !isHttps ? {} : headersFor(url)), Range: `bytes=${start}-` };
-      if (validators) resumeHeaders['If-Range'] = validators;
-      const req = lib.request(url, {
+      if (validators) resumeHeaders['If-Range'] = validators.etag || validators.mtime;
+      const reqUrl = requestUrlFor(url, proxyUrl);
+      const req = lib.request(reqUrl, {
         method: 'GET',
         headers: start > 0
           ? resumeHeaders
@@ -712,7 +736,7 @@ async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0, side
         ...TLS_INSECURE,
       }, (res) => {
         let next = null;
-        try { next = redirectTarget(res, url, depth); }
+        try { next = redirectTarget(res, reqUrl, depth); }
         catch (e) { res.resume(); reject(e); return; }
         if (next) {
           res.resume();
@@ -720,12 +744,14 @@ async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0, side
           return;
         }
         if (start > 0 && res.statusCode === 412) {
+          try { res.destroy(); } catch {}
           start = 0; // file changed under us: truncate and take the new version whole
           truncate();
           resolve('restart');
           return;
         }
         if (start > 0 && res.statusCode === 200) {
+          try { res.destroy(); } catch {}
           start = 0; // server ignored Range: restart from scratch
           truncate();
           resolve('restart');
@@ -734,6 +760,7 @@ async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0, side
         if (start > 0 && res.statusCode === 206) {
           const cr = parseContentRange(res.headers['content-range']);
           if (!cr || cr.start !== start) {
+            try { res.destroy(); } catch {}
             start = 0; // server disagrees about our offset: restart, don't append blindly
             truncate();
             resolve('restart');
@@ -744,6 +771,7 @@ async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0, side
             const rm = res.headers['last-modified'];
             if ((validators.etag && re && re !== validators.etag)
               || (validators.mtime && rm && rm !== validators.mtime)) {
+              try { res.destroy(); } catch {}
               start = 0; // republished mid-run: truncate, don't append alien bytes
               truncate();
               resolve('restart');
@@ -817,7 +845,8 @@ function benchFetch(urlStr, proxyUrl, maxBytes = 65536, depth = 0) {
     const isHttps = u.protocol === 'https:';
     const lib = isHttps ? https : http;
     const benchTimeout = Math.min(TIMEOUT, 10000);
-    const req = lib.request(urlStr, {
+    const reqUrl = requestUrlFor(urlStr, proxyUrl);
+    const req = lib.request(reqUrl, {
       // No custom headers through proxies on plain http: the proxy would see
       // credentials in the clear. (https targets are CONNECT-tunneled.)
       method: 'GET',
@@ -827,7 +856,7 @@ function benchFetch(urlStr, proxyUrl, maxBytes = 65536, depth = 0) {
       ...TLS_INSECURE,
     }, (res) => {
       let next = null;
-      try { next = redirectTarget(res, urlStr, depth); }
+      try { next = redirectTarget(res, reqUrl, depth); }
       catch { done(0); res.resume(); return; }
       if (next) {
         res.resume();
@@ -968,45 +997,65 @@ async function runDownload(targetUrl, retryOpts = {}) {
     }
     usedOutputs.add(resolved);
   }
-  // Completion receipts live in one hidden per-directory index (not beside
-  // every output): proves THIS tool produced this exact file (key covers
-  // origin+path+size+validator, not the query, so refreshed presigned URLs hit).
+  // Completion receipts live in one hidden per-directory store, one file per
+  // output (not one shared index): proves THIS tool produced this exact file
+  // (key covers origin+path+size+validator, not the query, so refreshed
+  // presigned URLs hit). Per-file receipts make parallel runs safe: no
+  // read-modify-write on a shared file, no shared temp name, and a corrupt
+  // receipt can only affect its own output, never siblings.
   const fileKey = manifestKey(originalTarget, info.size, info.etag, info.mtime);
-  const receiptIndexPath = path.join(path.dirname(path.resolve(outPath)), '.agent-dla-receipts.json');
-  let receiptsCorrupt = false;
-  const readReceipts = () => {
+  const receiptDir = path.join(path.dirname(path.resolve(outPath)), '.agent-dla', 'receipts');
+  const receiptPath = path.join(receiptDir, path.basename(outPath) + '.json');
+  const legacyIndexPath = path.join(path.dirname(path.resolve(outPath)), '.agent-dla-receipts.json');
+  const legacySinglePath = outPath + '.receipt.json';
+  const readReceipt = () => {
     try {
-      const r = JSON.parse(fs.readFileSync(receiptIndexPath, 'utf8'));
-      return r && typeof r === 'object' ? r : {};
-    } catch {
-      try {
-        if (fs.existsSync(receiptIndexPath)) {
-          receiptsCorrupt = true; // unparseable: don't trust it, rebuild below
-          fs.unlinkSync(receiptIndexPath);
-        }
-      } catch {}
-      return {};
+      const r = JSON.parse(fs.readFileSync(receiptPath, 'utf8'));
+      if (r && typeof r === 'object') return r;
+    } catch (e) {
+      if (e && e.code !== 'ENOENT') {
+        // Corrupt per-file receipt: confine the damage — drop just this
+        // file so its output re-downloads (with -o) or is refused (guard),
+        // siblings stay cached.
+        try { fs.unlinkSync(receiptPath); } catch {}
+      }
+      // else: no per-file receipt yet — fall through to legacy upgrade path.
     }
+    if (!fs.existsSync(receiptPath)) {
+      // Upgrade path: receipts written by older versions (shared index or
+      // legacy sidecar). Read-only: never mutate the shared index here, so
+      // parallel runs can't clobber each other. A corrupt legacy index is
+      // treated as missing, never fatal, never deleted here.
+      try {
+        const r = JSON.parse(fs.readFileSync(legacySinglePath, 'utf8'));
+        if (r && typeof r === 'object') return r;
+      } catch {}
+      try {
+        const idx = JSON.parse(fs.readFileSync(legacyIndexPath, 'utf8'));
+        const r = idx && typeof idx === 'object' ? idx[path.basename(outPath)] : null;
+        if (r && typeof r === 'object') return r;
+      } catch {}
+    }
+    return null;
   };
-  const readReceipt = () => { const r = readReceipts()[path.basename(outPath)]; return r && typeof r === 'object' ? r : null; };
   const writeReceipt = (sha) => {
     try {
-      const idx = readReceipts();
-      idx[path.basename(outPath)] = {
+      fs.mkdirSync(receiptDir, { recursive: true });
+      const body = JSON.stringify({
         key: fileKey, url: originalTarget, size: info.size,
         etag: info.etag || null, mtime: info.mtime || null, sha256: sha || null,
-      };
-      fs.writeFileSync(receiptIndexPath + '.tmp', JSON.stringify(idx));
-      fs.renameSync(receiptIndexPath + '.tmp', receiptIndexPath);
+      });
+      const tmp = `${receiptPath}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, body);
+      fs.renameSync(tmp, receiptPath);
     } catch {}
   };
   const dropReceipt = () => {
-    try {
-      const idx = readReceipts();
-      delete idx[path.basename(outPath)];
-      fs.writeFileSync(receiptIndexPath + '.tmp', JSON.stringify(idx));
-      fs.renameSync(receiptIndexPath + '.tmp', receiptIndexPath);
-    } catch {}
+    try { fs.unlinkSync(receiptPath); } catch {}
+    try { fs.unlinkSync(legacySinglePath); } catch {}
+    // The legacy shared index is intentionally left untouched: mutating it
+    // here would reintroduce the parallel read-modify-write race. It is only
+    // ever read (upgrade path) and is superseded by per-file receipts.
   };
   const wipeAll = () => {
     dropReceipt();
@@ -1068,9 +1117,9 @@ async function runDownload(targetUrl, retryOpts = {}) {
 
   // Never silently overwrite/clobber with a server-chosen name. Explicit -o
   // is user intent. A .partial/.manifest/.single.json proves a previous run
-  // of this tool: resume proceeds. A corrupt receipt index falls through to
-  // a clean re-download (which writes a fresh receipt).
-  if (!opts.output && !opts.overwrite && !receiptsCorrupt && fs.existsSync(outPath)
+  // of this tool: resume proceeds. Otherwise a valid receipt is required —
+  // a corrupt or missing receipt is refused, never silently overwritten.
+  if (!opts.output && !opts.overwrite && fs.existsSync(outPath)
     && !fs.existsSync(outPath + '.partial') && !fs.existsSync(outPath + '.manifest.json') && !fs.existsSync(outPath + '.single.json')) {
     guardFail(`refusing to overwrite existing "${path.basename(outPath)}" with a server-chosen name (use -o or --overwrite)`);
   }
