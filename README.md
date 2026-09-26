@@ -74,9 +74,12 @@ strings, and fragments; `--redact` extends that to human logs.
   treated as the worst possible outcome.
 - Path-scoped errors: a failure from one proxy or mirror evicts that path;
   only the direct primary can fail the file. Expired signed links (401/403/410
-  from a redirect) trigger a re-probe of the original URL. `If-Range`
-  validators (strong ETags, primary only) guard against the file changing
-  mid-download; stale ranges fall back to single-stream.
+  from a redirect) trigger a re-probe of the original URL; a revoked link
+  (definitive origin 4xx on re-probe) aborts fast, transient outages requeue.
+  `If-Range` validators (strong ETags, primary only; single-stream resume too)
+  guard against the file changing mid-download; stale ranges fall back to
+  single-stream, repeated validator flapping falls back as well — resumed
+  bytes are never mixed across versions.
 - Redirects are capped at 10 hops, non-HTTP targets and https-to-http
   downgrades refused. `--header` values only go to the original URL's origin.
 - Server-chosen filenames are sanitized (no traversal, no dotfiles, no
@@ -92,10 +95,12 @@ strings, and fragments; `--redact` extends that to human logs.
   before serving chunks; mismatches are evicted (warns without `--sha256`).
 - `--list` lines must be valid http(s) URLs or they are skipped without retries.
 - Probing has its own small budget; DNS and local filesystem errors fail fast.
-  `--deadline` cancels in-flight requests, it doesn't just stop new attempts.
-- `harvestScript`/`insecure`/`mirrors`/`proxies` are only honored from an
-  explicit `--config` — a config file sitting in the working directory cannot
-  run code, disable TLS, or route traffic.
+  `--deadline` cancels in-flight requests and bounds waits (Retry-After,
+  backoff, harvest) — it doesn't just stop new attempts.
+- `harvestScript`/`insecure`/`mirrors`/`proxies`/`headers`/`outputDir` are only
+  honored from an explicit `--config` — a config file sitting in the working
+  directory cannot run code, disable TLS, route traffic, add credentials, or
+  redirect output.
 
 ## Config file (`agent-dla.json`)
 

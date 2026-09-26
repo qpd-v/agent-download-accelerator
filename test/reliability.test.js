@@ -699,4 +699,240 @@ describe('reliability', () => {
       await msrv.close();
     }
   });
+
+  it('single-stream resume after republish downloads the new version', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-singlechange');
+    const crypto2 = require('crypto');
+    const v1 = crypto2.randomBytes(4 * MB);
+    const v2 = crypto2.randomBytes(4 * MB);
+    const h2 = crypto2.createHash('sha256').update(v2).digest('hex');
+    const t0 = Date.now();
+    const flipAt = t0 + 1000;
+    const liveSockets = new Set();
+    const s = require('http').createServer((q, res) => {
+      liveSockets.add(q.socket);
+      q.socket.on('close', () => liveSockets.delete(q.socket));
+      const cur = Date.now() > flipAt ? v2 : v1;
+      const etag = Date.now() > flipAt ? '"w2"' : '"w1"';
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : cur.length - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ETag: etag, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${cur.length}` } : {}) });
+      let off = a;
+      const tick = () => {
+        if (res.destroyed) return;
+        const n = Math.min(64 * 1024, b - off + 1);
+        res.write(cur.subarray(off, off + n));
+        off += n;
+        if (off > b) res.end();
+        else setTimeout(tick, 50); // ~1.3MB/s: 4MB takes ~3s
+      };
+      tick();
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    // kill all in-flight sockets mid-run: the resume carries If-Range into v2
+    setTimeout(() => { for (const sock of liveSockets) { try { sock.destroy(); } catch {} } }, 2000);
+    try {
+      const out = path.join(work, 'o.bin');
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/f.bin`, '-o', out, '-n', '1', '--json'], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.equal(H.sha256(out), h2, 'output is exactly the new version, not a mix');
+    } finally {
+      s.close();
+    }
+  });
+
+  it('revoked signed link fails fast instead of retrying ~49 minutes', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-revoked');
+    const t0 = Date.now();
+    let releases = 0;
+    let dropped = false;
+    const s = require('http').createServer((q, res) => {
+      const u = new URL(q.url, 'http://x');
+      if (u.pathname === '/release') {
+        releases++;
+        if (releases > 1) { res.writeHead(403); res.end('revoked'); return; }
+        res.writeHead(302, { Location: `/signed?exp=${Date.now() + 800}` });
+        res.end();
+        return;
+      }
+      if (Date.now() > +u.searchParams.get('exp')) { res.writeHead(403); res.end('expired'); return; }
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : 4 * MB - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${4 * MB}` } : {}) });
+      // drop one chunk after expiry so its retry hits the expired link
+      // (skips the 1-byte probe)
+      if (m && (b - a) > 100 && !dropped) {
+        dropped = true;
+        res.write(Buffer.alloc(1000, 5));
+        setTimeout(() => { try { q.socket.destroy(); } catch {} }, Math.max(0, t0 + 2000 - Date.now()));
+        return;
+      }
+      const body = Buffer.alloc(b - a + 1, 5);
+      let off = 0;
+      const tick = () => {
+        if (res.destroyed) return;
+        const n = Math.min(64 * 1024, body.length - off);
+        res.write(body.subarray(off, off + n));
+        off += n;
+        if (off >= body.length) res.end();
+        else setTimeout(tick, 250); // ~256KB/s: expiry (0.8s) hits mid-run
+      };
+      tick();
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const t0 = Date.now();
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/release`, '-o', path.join(work, 'o.bin'), '-n', '4', '--json'], { cwd: work });
+      const secs = (Date.now() - t0) / 1000;
+      assert.equal(r.code, 1);
+      assert.ok(secs < 30, `revoked link fails fast (took ${secs.toFixed(1)}s)`);
+      assert.match(r.stdout + r.stderr, /403|revoked|refresh failed/);
+    } finally {
+      s.close();
+    }
+  });
+
+  it('--deadline cuts a 100s Retry-After wait', { timeout: 60000 }, async () => {
+    const work = H.workdir('rel-retryafter-dl');
+    const s = require('http').createServer((q, res) => {
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      if (m && +m[1] === 0 && +m[2] === 0) {
+        res.writeHead(206, { 'Content-Range': 'bytes 0-0/1000', 'Content-Length': 1 });
+        res.end('A');
+        return;
+      }
+      res.writeHead(429, { 'Retry-After': '100' });
+      res.end('slow down');
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const t0 = Date.now();
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/f`, '-o', path.join(work, 'o.bin'), '-n', '2', '--json', '--deadline', '3000'], { cwd: work });
+      const secs = (Date.now() - t0) / 1000;
+      assert.equal(r.code, 1);
+      assert.ok(secs < 10, `deadline enforced (took ${secs.toFixed(1)}s)`);
+      assert.match(r.stdout + r.stderr, /deadline/);
+    } finally {
+      s.close();
+    }
+  });
+
+  it('--deadline bounds a 60s harvest', { timeout: 60000 }, async () => {
+    const work = H.workdir('rel-harvest-dl');
+    const src = H.makeFile(work, 'src.bin', 1 * MB);
+    const srv = await H.startServer({ '/f.bin': { buf: fs.readFileSync(src.path), tmp: path.join(work, 'srv.tmp') } });
+    try {
+      fs.writeFileSync(path.join(work, 'proxies.txt'), 'http://127.0.0.1:1\n');
+      fs.writeFileSync(path.join(work, 'sleeper.js'), 'setTimeout(() => {}, 60000);\n');
+      const t0 = Date.now();
+      const r = await H.runAccel([srv.url('/f.bin'), '-o', path.join(work, 'o.bin'), '-n', '2', '--json', '--deadline', '3000'], {
+        cwd: work,
+        env: { AGENT_DLA_HARVEST_SCRIPT: path.join(work, 'sleeper.js') },
+      });
+      const secs = (Date.now() - t0) / 1000;
+      // The harvest eats the whole budget, so the download itself must fail
+      // with deadline rather than run 60s+ over budget.
+      assert.equal(r.code, 1);
+      assert.ok(secs < 12, `harvest bounded by deadline (took ${secs.toFixed(1)}s)`);
+      assert.match(r.stdout + r.stderr, /deadline/);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('flapping validators fall back to single-stream and complete', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-lbmtime');
+    const buf = crypto.randomBytes(4 * MB);
+    const hash = crypto.createHash('sha256').update(buf).digest('hex');
+    let n = 0;
+    const s = require('http').createServer((q, res) => {
+      // RFC-strict on If-Range is not needed here: alternate Last-Modified
+      // on every response while serving identical bytes from "backends".
+      n++;
+      const mtime = n % 2 ? 'Wed, 01 Jan 2025 00:00:00 GMT' : 'Thu, 02 Jan 2025 00:00:00 GMT';
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : buf.length - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, 'Last-Modified': mtime, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${buf.length}` } : {}) });
+      res.end(buf.subarray(a, b + 1));
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'o.bin');
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/f.bin`, '-o', out, '-n', '4', '--json'], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.equal(H.sha256(out), hash);
+    } finally {
+      s.close();
+    }
+  });
+
+  it('corrupt receipt index leads to re-download, not refusal', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-receiptcorrupt');
+    const src = H.makeFile(work, 'src.bin', 1 * MB);
+    const srv = await H.startServer({ '/f.bin': { buf: fs.readFileSync(src.path), tmp: path.join(work, 'srv.tmp') } });
+    try {
+      const r1 = await H.runAccel([srv.url('/f.bin'), '--json'], { cwd: work });
+      assert.equal(r1.code, 0);
+      fs.writeFileSync(path.join(work, '.agent-dla-receipts.json'), '{corrupt!!!');
+      const r = await H.runAccel([srv.url('/f.bin'), '--json'], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.equal(H.sha256(path.join(work, 'f.bin')), src.hash);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('origin outage during refresh recovers', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-outage');
+    const buf = crypto.randomBytes(4 * MB);
+    const hash = crypto.createHash('sha256').update(buf).digest('hex');
+    const t0 = Date.now();
+    const outageUntil = t0 + 6000;
+    let dropped = false;
+    const s = require('http').createServer((q, res) => {
+      if (Date.now() < outageUntil && q.url !== '/release-probe-ok') {
+        // total outage: kill everything (but let the first probe through below)
+      }
+      const u = new URL(q.url, 'http://x');
+      if (u.pathname === '/release') {
+        if (Date.now() < outageUntil && Date.now() - t0 > 300) { try { q.socket.destroy(); } catch {} return; }
+        res.writeHead(302, { Location: `/signed?exp=${Date.now() + 1200}` });
+        res.end();
+        return;
+      }
+      if (Date.now() < outageUntil) { try { q.socket.destroy(); } catch {} return; }
+      if (Date.now() > +u.searchParams.get('exp')) { res.writeHead(403); res.end('expired'); return; }
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : buf.length - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ETag: '"stable"', ...(m ? { 'Content-Range': `bytes ${a}-${b}/${buf.length}` } : {}) });
+      if (a === 2 * MB && !dropped) {
+        dropped = true;
+        res.write(buf.subarray(a, a + 1000));
+        setTimeout(() => { try { q.socket.destroy(); } catch {} }, 500);
+        return;
+      }
+      let off = a;
+      const tick = () => {
+        if (res.destroyed) return;
+        const n = Math.min(64 * 1024, b - off + 1);
+        res.write(buf.subarray(off, off + n));
+        off += n;
+        if (off > b) res.end();
+        else setTimeout(tick, 120); // ~500KB/s: attempts span the outage
+      };
+      tick();
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'o.bin');
+      const t1 = Date.now();
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/release`, '-o', out, '-n', '4', '--json'], { cwd: work });
+      const secs = (Date.now() - t1) / 1000;
+      assert.equal(r.code, 0);
+      assert.equal(H.sha256(out), hash);
+      assert.ok(secs < 60, `recovered after outage (took ${secs.toFixed(1)}s)`);
+    } finally {
+      s.close();
+    }
+  });
 });
