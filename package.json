@@ -1,0 +1,30 @@
+{
+  "name": "agent-download-accelerator",
+  "version": "1.0.0",
+  "description": "Agent Download Accelerator: parallel Range chunks, mirrors, proxy rotation, resume",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "type": "commonjs",
+  "bin": {
+    "agent-dla": "./agent-dla.js"
+  },
+  "files": [
+    "agent-dla.js",
+    "get-proxies.js",
+    "proxies.example.txt",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node agent-dla.js --help",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "http-proxy-agent": "^7.0.2",
+    "https-proxy-agent": "^7.0.5",
+    "socks-proxy-agent": "^8.0.5"
+  }
+}

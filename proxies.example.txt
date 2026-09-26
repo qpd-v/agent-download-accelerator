@@ -1,0 +1,4 @@
+# one proxy per line, # = comment
+# http://user:pass@192.0.2.10:8080
+# http://192.0.2.11:8080
+# socks5://192.0.2.12:1080
