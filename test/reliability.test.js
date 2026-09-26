@@ -1110,7 +1110,7 @@ describe('reliability', () => {
         res.write(cur.subarray(off, off + n));
         off += n;
         if (off > b) res.end();
-        else setTimeout(tick, 60); // ~1MB/s per chunk: kill lands mid-flight
+        else setTimeout(tick, 250); // ~256KB/s per chunk: the kill always lands mid-flight
       };
       tick();
     });
@@ -1124,10 +1124,116 @@ describe('reliability', () => {
       c.kill();
       await closed;
       assert.ok(fs.existsSync(out + '.partial'), 'partial kept after kill');
+      const mk = JSON.parse(fs.readFileSync(out + '.manifest.json', 'utf8'));
+      const kept = (mk.done || []).reduce((t, [x, y]) => t + (y - x + 1), 0)
+        + Object.values(mk.active || {}).reduce((t, a) => t + (Array.isArray(a) ? Math.max(0, a[1] - a[0]) : 0), 0);
+      assert.ok(kept > 0 && kept < 8 * MB, `kill landed mid-flight (kept ${(kept / MB).toFixed(1)}MB of 8MB)`);
       // ?id=2 must not reuse ?id=1's manifest: output must be exactly id=2.
       const r = await H.runAccel([`${base}?id=2`, '-o', out, '-n', '4', '--json'], { cwd: work });
       assert.equal(r.code, 0);
       assert.equal(H.sha256(out), h2, 'output is exactly id=2, no mixed blocks');
+    } finally {
+      s.close();
+    }
+  });
+
+  it('shared strong ETag across queries never merges identities', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-queryetags');
+    const b1 = crypto.randomBytes(2 * MB);
+    const b2 = crypto.randomBytes(2 * MB);
+    const h1 = crypto.createHash('sha256').update(b1).digest('hex');
+    const h2 = crypto.createHash('sha256').update(b2).digest('hex');
+    // Same path, same size, same STRONG ETag on different content (e.g. an
+    // mtime-size ETag behind an X-Accel-Redirect endpoint). The query still
+    // selects the resource: identities must differ.
+    const s = require('http').createServer((q, res) => {
+      const u = new URL(q.url, 'http://x');
+      const cur = u.searchParams.get('id') === '2' ? b2 : b1;
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : cur.length - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ETag: '"v1"', ...(m ? { 'Content-Range': `bytes ${a}-${b}/${cur.length}` } : {}) });
+      res.end(cur.subarray(a, b + 1));
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const base = `http://127.0.0.1:${s.address().port}/f.bin`;
+      const r1 = await H.runAccel([`${base}?id=1`, '--json'], { cwd: work });
+      assert.equal(r1.code, 0);
+      assert.equal(H.sha256(path.join(work, 'f.bin')), h1);
+      const r2 = await H.runAccel([`${base}?id=2`, '--json'], { cwd: work });
+      assert.equal(r2.code, 1, 'shared ETag must not merge queries: refuse, never wrong-bytes-exit-0');
+      assert.equal(H.sha256(path.join(work, 'f.bin')), h1, 'refused run leaves id=1 untouched');
+      const r3 = await H.runAccel([`${base}?id=2`, '--json', '--overwrite'], { cwd: work });
+      assert.equal(r3.code, 0);
+      assert.equal(H.sha256(path.join(work, 'f.bin')), h2, 'output is exactly id=2');
+    } finally {
+      s.close();
+    }
+  });
+
+  it('refreshed presigned link without an ETag still resumes', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-presignresume');
+    const buf = crypto.randomBytes(2 * MB);
+    const hash = crypto.createHash('sha256').update(buf).digest('hex');
+    // Only signature/expiry params differ between refreshes; no ETag at all.
+    // The stripped identity matches, so the rerun is cached, not redownloaded.
+    const s = require('http').createServer((q, res) => {
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : buf.length - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${buf.length}` } : {}) });
+      res.end(buf.subarray(a, b + 1));
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const base = `http://127.0.0.1:${s.address().port}/f.bin`;
+      const q1 = 'X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AK&X-Amz-Date=20250101&X-Amz-Expires=60&X-Amz-Signature=aaa&X-Amz-SignedHeaders=host';
+      const q2 = 'X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AK&X-Amz-Date=20250102&X-Amz-Expires=60&X-Amz-Signature=bbb&X-Amz-SignedHeaders=host';
+      const r1 = await H.runAccel([`${base}?${q1}`, '-o', path.join(work, 'o.bin'), '--json'], { cwd: work });
+      assert.equal(r1.code, 0);
+      const r2 = await H.runAccel([`${base}?${q2}`, '-o', path.join(work, 'o.bin'), '--json'], { cwd: work });
+      assert.equal(r2.code, 0);
+      assert.ok(H.events(r2.stdout).some((e) => e.event === 'done' && e.cached === true), 'refreshed link resumes via stripped identity');
+      assert.equal(H.sha256(path.join(work, 'o.bin')), hash);
+    } finally {
+      s.close();
+    }
+  });
+
+  it('one-off 403 on refresh recovers, persistent 403 still aborts (flap403)', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-flap403');
+    const buf = crypto.randomBytes(4 * MB);
+    const hash = crypto.createHash('sha256').update(buf).digest('hex');
+    let releases = 0;
+    const s = require('http').createServer((q, res) => {
+      const u = new URL(q.url, 'http://x');
+      if (u.pathname === '/release') {
+        releases++;
+        if (releases === 2) { res.writeHead(403); res.end('flap'); return; } // one-off
+        res.writeHead(302, { Location: `/signed?exp=${Date.now() + 1500}` });
+        res.end();
+        return;
+      }
+      if (Date.now() > +u.searchParams.get('exp')) { res.writeHead(403); res.end('expired'); return; }
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : buf.length - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${buf.length}` } : {}) });
+      let off = a;
+      const tick = () => {
+        if (res.destroyed) return;
+        const n = Math.min(64 * 1024, b - off + 1);
+        res.write(buf.subarray(off, off + n));
+        off += n;
+        if (off > b) res.end();
+        else setTimeout(tick, 120); // expiry (1.5s) hits mid-run, refresh flaps once
+      };
+      tick();
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'o.bin');
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/release`, '-o', out, '-n', '4', '--json'], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.equal(H.sha256(out), hash);
     } finally {
       s.close();
     }

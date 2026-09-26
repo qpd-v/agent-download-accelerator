@@ -75,7 +75,9 @@ strings, and fragments; `--redact` extends that to human logs.
 - Path-scoped errors: a failure from one proxy or mirror evicts that path;
   only the direct primary can fail the file. Expired signed links (401/403/410
   from a redirect) trigger a re-probe of the original URL; a revoked link
-  (definitive origin 4xx on re-probe) aborts fast, transient outages requeue.
+  (definitive origin 4xx on re-probe, twice in a row) aborts fast while a
+  one-off 403 gets a second chance, a 403/429 with Retry-After waits once,
+  and transient outages requeue.
   `If-Range` validators (strong ETags, primary only; single-stream resume too)
   guard against the file changing mid-download; stale ranges fall back to
   single-stream, repeated validator flapping falls back as well — resumed
@@ -94,9 +96,12 @@ strings, and fragments; `--redact` extends that to human logs.
   (`.agent-dla/receipts/<name>.json`, one file per output, atomic writes);
   reruns trust size+receipt (or `--sha256`), never size alone. Parallel runs
   into one directory are safe; a corrupt receipt affects only its own file.
-  Resume identity ignores URL query strings only when a strong ETag proves
-  the object (so refreshed presigned URLs resume); otherwise the full query
-  is part of the identity, so `?id=1` vs `?id=2` never share a manifest.
+  Resume identity keeps the URL query string, except signature/expiry
+  parameters (`X-Amz-*`, `X-Goog-*`, `Signature`, `Expires`, `Key-Pair-Id`,
+  `Policy`, `sig`, `se`, `sp`, `sv`, `st`, `sr`, `token`) which are dropped —
+  so `?id=1` vs `?id=2` never share a manifest (even with identical ETags),
+  while a refreshed presigned URL resumes the same file with or without an
+  ETag.
   A republished file (validator change) restarts clean instead of mixing versions.
 - Each mirror must byte-match first- and last-1KB samples of the primary
   before serving chunks; mismatches are evicted (warns without `--sha256`).

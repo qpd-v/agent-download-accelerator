@@ -265,17 +265,32 @@ function sanitizeUrlName(raw) {
   if (!base || base === '.' || base === '..') return 'download.bin';
   return base;
 }
-// Manifest/receipt identity: origin + path + size + validator. The query
-// string is dropped ONLY when a strong ETag proves the object identity, so a
-// refreshed presigned URL resumes the same download. Otherwise the full query
-// is part of the key: ?id=1 vs ?id=2 can select different bytes, and sharing
-// a manifest/receipt across them mixes versions with exit 0 (N1).
+// Manifest/receipt identity: origin + path + query + size + validator. Query
+// parameters that only carry signatures/expiry (presigned URLs) are dropped
+// so a refreshed link resumes the same download; everything else (e.g. ?id=1)
+// selects content and stays in the key. A shared strong ETag across different
+// queries must NOT merge identities: an ETag versions one resource, and a
+// different query is a different resource (Q1).
+const SIG_QUERY_PARAMS = new Set([
+  'signature', 'expires', 'key-pair-id', 'policy',
+  'sig', 'se', 'sp', 'sv', 'st', 'sr', 'token',
+]);
+function stripSigQuery(search) {
+  if (!search || search === '?') return '';
+  const kept = [];
+  for (const pair of search.slice(1).split('&')) {
+    let name = pair.split('=', 1)[0] || '';
+    try { name = decodeURIComponent(name).toLowerCase(); }
+    catch { name = name.toLowerCase(); }
+    if (name.startsWith('x-amz-') || name.startsWith('x-goog-') || SIG_QUERY_PARAMS.has(name)) continue;
+    kept.push(pair);
+  }
+  return kept.length ? `?${kept.join('&')}` : '';
+}
 function manifestKey(targetUrl, size, etag, mtime) {
   try {
     const u = new URL(String(targetUrl));
-    const strong = !!etag && !/^W\//i.test(etag);
-    const base = strong ? `${u.origin}${u.pathname}` : `${u.origin}${u.pathname}${u.search}`;
-    return `${base}|${size}|${etag || ''}|${mtime || ''}`;
+    return `${u.origin}${u.pathname}${stripSigQuery(u.search)}|${size}|${etag || ''}|${mtime || ''}`;
   } catch { return `${String(targetUrl)}|${size}|${etag || ''}|${mtime || ''}`; }
 }
 // Shared redirect policy: capped chain, http(s) only, no https->http downgrade.
@@ -561,10 +576,11 @@ async function getFileInfo(url) {
         } catch (e) { lastErr = e; continue; }
       }
       lastErr = new Error(`probe via ${redactProxy(proxy)}: HTTP ${r.status}`);
+      lastErr.status = r.status;
+      lastErr.retryAfter = parseRetryAfter(r.headers || {});
       if (proxy === null && r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429) {
         directErr = lastErr;
         directErr.fatal = true;
-        directErr.status = r.status;
       }
       // proxy-path 4xx only condemns that path; other paths are still tried
     }
@@ -1391,6 +1407,8 @@ async function runDownload(targetUrl, retryOpts = {}) {
   let primaryUrl = url;
   let signedRefreshes = 0;
   let refreshingSigned = null;
+  let refreshDefinitiveFails = 0; // consecutive definitive 4xx on the refresh probe
+  let refreshRateWaited = false; // one Retry-After wait per file (finding 5)
   function pickSrc(job) {
     if (job.src && !badMirrors.has(job.src)) return job.src;
     for (const s of SOURCES) { if (!badMirrors.has(s) && s !== primaryUrl) return s; }
@@ -1415,7 +1433,20 @@ async function runDownload(targetUrl, retryOpts = {}) {
     if (refreshingSigned) { await refreshingSigned.catch(() => {}); return job.src === primaryUrl; }
     refreshingSigned = (async () => {
       signedRefreshes++;
-      const fresh = await getFileInfo(originalTarget);
+      let fresh;
+      try {
+        fresh = await getFileInfo(originalTarget);
+      } catch (e) {
+        const st = e && e.status;
+        // Rate-limited refresh (e.g. GitHub's secondary limit answers 403 +
+        // Retry-After): wait once (bounded by the deadline), then try once more.
+        if ((st === 403 || st === 429) && e.retryAfter > 0 && !refreshRateWaited) {
+          refreshRateWaited = true;
+          say(`Refresh rate-limited (HTTP ${st}), waiting ${e.retryAfter}s...`);
+          await sleepOrDeadline(Math.min(e.retryAfter, 120) * 1000);
+          fresh = await getFileInfo(originalTarget);
+        } else throw e;
+      }
       if (fresh.size && fresh.size !== size) {
         const e = new Error(`file changed mid-download (was ${fmtSize(size)}, now ${fmtSize(fresh.size)})`);
         e.fatal = true;
@@ -1442,13 +1473,19 @@ async function runDownload(targetUrl, retryOpts = {}) {
     catch (e) {
       refreshingSigned = null;
       if (e && e.code === 'CHANGED') throw e;
-      // A definitive origin error (direct 4xx) means the link is revoked, not
-      // blipping: abort instead of requeueing for ~49 minutes. Anything else
+      if (e && e.message === 'deadline exceeded') throw e;
+      // A definitive origin error (direct 4xx) usually means the link is
+      // revoked: abort — but only on the SECOND consecutive one, so a
+      // one-off 403 (flap) gets one more chance (finding 5). Anything else
       // (DNS, reset, 5xx, timeout) returns false: retry later on another path.
-      if (e && e.fatal && e.status >= 400 && e.status < 500 && e.status !== 408 && e.status !== 429) throw e;
+      if (e && e.fatal && e.status >= 400 && e.status < 500 && e.status !== 408 && e.status !== 429) {
+        if (++refreshDefinitiveFails >= 2) throw e;
+        return false; // first strike: requeue, confirm on the next 403
+      }
       return false; // transient probe blip: retry later on another path
     }
     refreshingSigned = null;
+    refreshDefinitiveFails = 0; // a good refresh clears the strike count
     if (job.src !== primaryUrl) job.src = primaryUrl;
     return true;
   }
@@ -1515,6 +1552,7 @@ async function runDownload(targetUrl, retryOpts = {}) {
               if (await refreshSignedUrl(job)) continue;
             } catch (re) {
               if (re && re.code === 'CHANGED') return { fresh: true };
+              return { fatal: re }; // definitive (revoked/cap): abort, don't requeue
             }
           }
           if (path4xx || cls === 'fatal' || e.code === 'ENOTFOUND') continue; // next path, no backoff
