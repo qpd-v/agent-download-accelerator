@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const { spawn } = require('child_process');
+const crypto = require('crypto');
 const H = require('./helpers');
 
 const MB = 1048576;
@@ -45,7 +46,9 @@ describe('reliability', () => {
 
   it('expired signed redirect is refreshed, download completes', { timeout: 120000 }, async () => {
     const work = H.workdir('rel-signed');
-    const buf = Buffer.alloc(8 * MB, 7);
+    const crypto = require('crypto');
+    const buf = crypto.randomBytes(8 * MB);
+    const hash = crypto.createHash('sha256').update(buf).digest('hex');
     let dropped = false;
     const s = http.createServer((q, res) => {
       const u = new URL(q.url, 'http://x');
@@ -64,7 +67,7 @@ describe('reliability', () => {
       assert.equal(r.code, 0);
       const ev = H.events(r.stdout);
       assert.ok(ev.some((e) => e.event === 'signed-refresh'), 'signed link was refreshed');
-      assert.equal(H.sha256(out), require('crypto').createHash('sha256').update(buf).digest('hex'));
+      assert.equal(H.sha256(out), hash);
     } finally {
       s.close();
     }
@@ -124,25 +127,48 @@ describe('reliability', () => {
 
   it('kill keeps byte-level progress in the manifest', { timeout: 180000 }, async () => {
     const work = H.workdir('rel-manifest');
-    const src = H.makeFile(work, 'src.bin', 40 * MB);
-    const buf = fs.readFileSync(src.path);
-    const srv = await H.startServer({ '/f.bin': { buf, tmp: path.join(work, 'srv.tmp') } }, () => ({ slowBps: 2 * MB }));
+    const crypto = require('crypto');
+    const buf = crypto.randomBytes(40 * MB);
+    const hash = crypto.createHash('sha256').update(buf).digest('hex');
+    let served = 0;
+    const s = require('http').createServer((q, res) => {
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : buf.length - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${buf.length}` } : {}) });
+      let off = a;
+      const tick = () => {
+        if (res.destroyed) return;
+        const n = Math.min(64 * 1024, b - off + 1);
+        served += n;
+        res.write(buf.subarray(off, off + n));
+        off += n;
+        if (off > b) res.end();
+        else setTimeout(tick, 100); // ~640KB/s per chunk: 40MB takes ~16s
+      };
+      tick();
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
     try {
+      const fileUrl = `http://127.0.0.1:${s.address().port}/f.bin`;
       const out = path.join(work, 'o.bin');
-      const c = spawn('node', [H.AGENT_DLA, srv.url('/f.bin'), '-o', out, '-n', '4'], { cwd: work });
-      await H.sleep(4500);
+      const c = spawn('node', [H.AGENT_DLA, fileUrl, '-o', out, '-n', '4'], { cwd: work });
+      const closed = new Promise((r) => c.on('close', r));
+      await H.sleep(4500); // 10MB chunks at ~4MB/s: mid-flight
       c.kill();
-      await new Promise((r) => c.on('close', r));
+      await closed;
       assert.ok(fs.existsSync(out + '.partial'), 'partial kept after kill');
       const m = JSON.parse(fs.readFileSync(out + '.manifest.json', 'utf8'));
-      const kept = (m.done || []).reduce((t, [s, e]) => t + (e - s + 1), 0)
-        + Object.values(m.active || {}).reduce((t, [s, x]) => t + Math.max(0, x - s), 0);
+      const kept = (m.done || []).reduce((t, [s2, e]) => t + (e - s2 + 1), 0)
+        + Object.values(m.active || {}).reduce((t, [s2, x]) => t + Math.max(0, x - s2), 0);
       assert.ok(kept > 0, 'manifest records transferred bytes');
-      const r = await H.runAccel([srv.url('/f.bin'), '-o', out, '-n', '4', '--json'], { cwd: work });
+      const run1 = served;
+      served = 0;
+      const r = await H.runAccel([fileUrl, '-o', out, '-n', '4', '--json'], { cwd: work });
       assert.equal(r.code, 0);
-      assert.equal(H.sha256(out), src.hash);
+      assert.equal(H.sha256(out), hash);
+      assert.ok(served < 40 * MB - kept / 2, `rerun transferred less (${(served / MB).toFixed(1)}MB of 40MB, kept ${(kept / MB).toFixed(1)}MB)`);
     } finally {
-      await srv.close();
+      s.close();
     }
   });
 
@@ -227,7 +253,8 @@ describe('reliability', () => {
   it('-n above 32 opens at most 32 concurrent transfers', { timeout: 120000 }, async () => {
     const work = H.workdir('rel-conc');
     const MB = 1048576;
-    const big = Buffer.alloc(8 * MB, 1);
+    const big = require('crypto').randomBytes(8 * MB);
+    const bigHash = require('crypto').createHash('sha256').update(big).digest('hex');
     let cur = 0, max = 0;
     const s = require('http').createServer((q, res) => {
       const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
@@ -244,7 +271,187 @@ describe('reliability', () => {
       const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/big.bin`, '-o', out, '-n', '64', '--json'], { cwd: work });
       assert.equal(r.code, 0);
       assert.ok(max <= 32, `at most 32 concurrent (saw ${max})`);
-      assert.equal(H.sha256(out), require('crypto').createHash('sha256').update(big).digest('hex'));
+      assert.equal(H.sha256(out), bigHash);
+    } finally {
+      s.close();
+    }
+  });
+
+  it('--header reaches the origin but never the redirect target', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-header');
+    const crypto = require('crypto');
+    const buf = crypto.randomBytes(2 * MB);
+    const hash = crypto.createHash('sha256').update(buf).digest('hex');
+    const seen1 = [], seen2 = [];
+    const s2 = require('http').createServer((q, res) => {
+      seen2.push(q.headers['x-token'] || null);
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : buf.length - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${buf.length}` } : {}) });
+      res.end(buf.subarray(a, b + 1));
+    });
+    await new Promise((ok) => s2.listen(0, '127.0.0.1', ok));
+    const url2 = `http://127.0.0.1:${s2.address().port}/file`;
+    const s1 = require('http').createServer((q, res) => {
+      seen1.push(q.headers['x-token'] || null);
+      if (q.headers['x-token'] !== 's3cr3t') { res.writeHead(403); res.end('nope'); return; }
+      res.writeHead(302, { Location: url2 }); res.end();
+    });
+    await new Promise((ok) => s1.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'o.bin');
+      const r = await H.runAccel([`http://127.0.0.1:${s1.address().port}/file`, '-o', out, '-n', '4', '--json', '--header', 'X-Token: s3cr3t'], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.equal(H.sha256(out), hash);
+      assert.ok(seen1.length > 0 && seen1.every((v) => v === 's3cr3t'), 'origin got the token');
+      assert.ok(seen2.length > 0 && seen2.every((v) => v === null || v === undefined), 'redirect target never saw the token');
+    } finally {
+      s1.close();
+      s2.close();
+    }
+  });
+
+  it('--deadline aborts a slow download', { timeout: 60000 }, async () => {
+    const work = H.workdir('rel-deadline');
+    const big = Buffer.alloc(32 * MB, 9);
+    const s = require('http').createServer((q, res) => {
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : big.length - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${big.length}` } : {}) });
+      let off = a;
+      const tick = () => {
+        if (res.destroyed) return;
+        const n = Math.min(64 * 1024, b - off + 1);
+        res.write(big.subarray(off, off + n));
+        off += n;
+        if (off > b) res.end();
+        else setTimeout(tick, 200); // ~320KB/s: 32MB takes ~100s
+      };
+      tick();
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const t0 = Date.now();
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/big`, '-o', path.join(work, 'o.bin'), '-n', '2', '--json', '--deadline', '3000'], { cwd: work });
+      const secs = (Date.now() - t0) / 1000;
+      assert.equal(r.code, 1);
+      assert.ok(secs < 15, `deadline enforced (took ${secs.toFixed(1)}s)`);
+      assert.match(r.stdout + r.stderr, /deadline/);
+    } finally {
+      s.close();
+    }
+  });
+
+  it('proxy passing the bench but 403ing chunks is evicted', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-403evict');
+    const src = H.makeFile(work, 'src.bin', 2 * MB);
+    const buf = fs.readFileSync(src.path);
+    const srv = await H.startServer({ '/f.bin': { buf, tmp: path.join(work, 'srv.tmp') } });
+    // proxy: serves the 64KB bench sample correctly, 403s everything else
+    const px = await H.startForwardProxy((clientReq, clientRes) => {
+      const m = /bytes=(\d+)-(\d*)/.exec(clientReq.headers.range || '');
+      if (m && +m[2] - +m[1] + 1 <= 65536 && +m[1] === 0) {
+        const t = new URL(clientReq.url);
+        const preq = http.request({ host: t.hostname, port: t.port, path: t.pathname, method: 'GET', headers: { range: clientReq.headers.range } }, (r) => { clientRes.writeHead(r.statusCode, r.headers); r.pipe(clientRes); });
+        preq.on('error', () => { try { clientRes.writeHead(502); clientRes.end(); } catch {} });
+        preq.end();
+        return;
+      }
+      clientRes.writeHead(403, { 'Content-Type': 'text/html' });
+      clientRes.end('<h1>blocked</h1>');
+    });
+    try {
+      fs.writeFileSync(path.join(work, 'proxies.txt'), `http://127.0.0.1:${px.port}\n`);
+      const out = path.join(work, 'o.bin');
+      const r = await H.runAccel([srv.url('/f.bin'), '-o', out, '-n', '2', '--json', '--no-auto-refresh'], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.equal(H.sha256(out), src.hash);
+      const ev = H.events(r.stdout);
+      assert.ok(ev.filter((e) => e.event === 'chunk-done').length >= 2);
+    } finally {
+      px.close();
+      await srv.close();
+    }
+  });
+
+  it('--max-retries 0 fails chunk attempts fast', { timeout: 60000 }, async () => {
+    const work = H.workdir('rel-maxr0chunk');
+    const s = require('http').createServer((q, res) => {
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      if (m && +m[1] === 0 && +m[2] === 0) {
+        res.writeHead(206, { 'Content-Range': 'bytes 0-0/1000', 'Content-Length': 1 });
+        res.end('A');
+        return;
+      }
+      if (m) { res.writeHead(500); res.end('boom'); return; }
+      res.writeHead(200, { 'Content-Length': 1000, 'Accept-Ranges': 'bytes' });
+      res.end(Buffer.alloc(1000, 1));
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const t0 = Date.now();
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/f`, '-o', path.join(work, 'o.bin'), '-n', '2', '--json', '--max-retries', '0'], { cwd: work });
+      assert.ok(Date.now() - t0 < 30000);
+      assert.equal(r.code, 1);
+    } finally {
+      s.close();
+    }
+  });
+
+  it('same-size stranger file without proof is redownloaded, then cached', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-collide');
+    const src = H.makeFile(work, 'src.bin', 1 * MB);
+    const srv = await H.startServer({ '/f.bin': { buf: fs.readFileSync(src.path), tmp: path.join(work, 'srv.tmp') } });
+    try {
+      const out = path.join(work, 'o.bin');
+      fs.writeFileSync(out, crypto.randomBytes(1 * MB)); // stranger, same size
+      let r = await H.runAccel([srv.url('/f.bin'), '-o', out, '-n', '2', '--json'], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.equal(H.sha256(out), src.hash, 'stranger content replaced by server content');
+      r = await H.runAccel([srv.url('/f.bin'), '-o', out, '-n', '2', '--json'], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.ok(H.events(r.stdout).some((e) => e.event === 'done' && e.cached === true), 'receipt makes rerun cached');
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('mirror serving different bytes is evicted at the content check', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-evilmirror');
+    const src = H.makeFile(work, 'src.bin', 2 * MB);
+    const buf = fs.readFileSync(src.path);
+    const evil = Buffer.from(buf);
+    evil[100] ^= 0xff;
+    const srv = await H.startServer({ '/f.bin': { buf, tmp: path.join(work, 'srv.tmp') } });
+    const msrv = await H.startServer({ '/f.bin': { buf: evil, tmp: path.join(work, 'srv2.tmp') } });
+    try {
+      const out = path.join(work, 'o.bin');
+      const r = await H.runAccel([srv.url('/f.bin'), '--mirror', msrv.url('/f.bin'), '-o', out, '-n', '4', '--json'], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.equal(H.sha256(out), src.hash);
+      assert.match(r.stderr, /content check, evicted/);
+    } finally {
+      await srv.close();
+      await msrv.close();
+    }
+  });
+
+  it('--overwrite truncates instead of appending to a stranger file', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-overwrite');
+    const buf = crypto.randomBytes(1 * MB);
+    // single-stream server: ignores Range, always serves the whole file
+    const s = require('http').createServer((q, res) => {
+      res.writeHead(200, { 'Content-Length': buf.length });
+      res.end(buf);
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'o.bin');
+      fs.writeFileSync(out, crypto.randomBytes(100)); // stranger, smaller
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/f.bin`, '-o', out, '-n', '1', '--json', '--overwrite'], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.equal(fs.statSync(out).size, buf.length);
+      assert.ok(fs.readFileSync(out).equals(buf), 'output equals the server file exactly');
     } finally {
       s.close();
     }

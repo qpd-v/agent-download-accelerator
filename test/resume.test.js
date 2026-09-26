@@ -8,7 +8,7 @@ const H = require('./helpers');
 describe('resume', () => {
   it('kill mid-download then rerun completes byte-identical', { timeout: 180000 }, async () => {
     const work = H.workdir('resume');
-    const src = H.makeFile(work, 'src.bin', 12 * 1024 * 1024, 11);
+    const src = H.makeFile(work, 'src.bin', 40 * 1024 * 1024);
     const srv2 = await H.startServer(
       { '/f.bin': { buf: fs.readFileSync(src.path), tmp: path.join(work, 'srv.tmp') } },
       () => ({ slowBps: 2 * 1024 * 1024 }), // throttle so the kill lands mid-download
@@ -16,9 +16,10 @@ describe('resume', () => {
     try {
       const out = path.join(work, 'out.bin');
       const child = spawn('node', [H.AGENT_DLA, srv2.url('/f.bin'), '-o', out, '-n', '4'], { cwd: work });
-      await H.sleep(2500);
+      const closed = new Promise((r) => child.on('close', r));
+      await H.sleep(4000); // 10MB chunks at ~2MB/s: mid-flight
       child.kill(); // hard kill: no handlers run (Windows TerminateProcess)
-      await new Promise((r) => child.on('close', r));
+      await closed;
       const parts = path.join(work, 'out.bin.partial');
       const manifest = path.join(work, 'out.bin.manifest.json');
       assert.ok(fs.existsSync(parts), 'partial kept after kill');
@@ -33,7 +34,7 @@ describe('resume', () => {
 
   it('rerun with different -n after partial parts stays byte-identical', { timeout: 180000 }, async () => {
     const work = H.workdir('resume-layout');
-    const src = H.makeFile(work, 'src.bin', 12 * 1024 * 1024, 5);
+    const src = H.makeFile(work, 'src.bin', 40 * 1024 * 1024);
     const srv = await H.startServer(
       { '/f.bin': { buf: fs.readFileSync(src.path), tmp: path.join(work, 'srv.tmp') } },
       () => ({ slowBps: 2 * 1024 * 1024 }),
@@ -41,12 +42,38 @@ describe('resume', () => {
     try {
       const out = path.join(work, 'out.bin');
       const child = spawn('node', [H.AGENT_DLA, srv.url('/f.bin'), '-o', out, '-n', '4'], { cwd: work });
-      await H.sleep(2500);
+      const closed = new Promise((r) => child.on('close', r));
+      await H.sleep(4000); // 10MB chunks at ~2MB/s: mid-flight
+
       child.kill();
-      await new Promise((r) => child.on('close', r));
+      await closed;
       assert.ok(fs.existsSync(out + '.partial'), 'partial kept');
       assert.ok(fs.existsSync(out + '.manifest.json'), 'manifest kept');
       const r = await H.runAccel([srv.url('/f.bin'), '-o', out, '-n', '2', '--json'], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.equal(H.sha256(out), src.hash);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('single-stream kill then rerun resumes from the sidecar', { timeout: 180000 }, async () => {
+    const work = H.workdir('resume-single');
+    const src = H.makeFile(work, 'src.bin', 12 * 1024 * 1024);
+    const srv = await H.startServer(
+      { '/f.bin': { buf: fs.readFileSync(src.path), tmp: path.join(work, 'srv.tmp') } },
+      () => ({ slowBps: 2 * 1024 * 1024 }),
+    );
+    try {
+      const out = path.join(work, 'out.bin');
+      const child = spawn('node', [H.AGENT_DLA, srv.url('/f.bin'), '-o', out, '-n', '1'], { cwd: work });
+      const closed = new Promise((r) => child.on('close', r));
+      await H.sleep(2500); // 3MB chunks at ~2MB/s: mid-flight
+
+      child.kill();
+      await closed;
+      assert.ok(fs.existsSync(out + '.single.json'), 'sidecar kept after kill');
+      const r = await H.runAccel([srv.url('/f.bin'), '-o', out, '-n', '1', '--json'], { cwd: work });
       assert.equal(r.code, 0);
       assert.equal(H.sha256(out), src.hash);
     } finally {

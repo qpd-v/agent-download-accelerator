@@ -96,9 +96,10 @@ describe('corruption', () => {
     try {
       const out = path.join(work, 'out.bin');
       const c = spawn('node', [H.AGENT_DLA, srv.url('/f.bin'), '-o', out, '-n', '4'], { cwd: work, env: { ...process.env, ...FAST } });
-      await H.sleep(14000);
+      const closed = new Promise((r) => c.on('close', r));
+      await H.sleep(14000); // stalled chunks guarantee mid-flight
       c.kill();
-      await new Promise((r) => c.on('close', r));
+      await closed;
       run = 2;
       const r = await H.runAccel([srv.url('/f.bin'), '-o', out, '-n', '4', '--json'], { cwd: work, env: FAST });
       assert.equal(r.code, 0);
@@ -111,8 +112,82 @@ describe('corruption', () => {
     }
   });
 
-  it('zero-byte file downloads as empty with exit 0', { timeout: 60000 }, async () => {
-    const work = H.workdir('corr-zero');
+  it('weak ETag servers and foreign-ETag mirrors serve 206s', { timeout: 120000 }, async () => {
+    const work = H.workdir('corr-weaketag');
+    const buf = crypto.randomBytes(4 * 1024 * 1024);
+    const hash = crypto.createHash('sha256').update(buf).digest('hex');
+    let mirrorSawIfRange = 0;
+    let mirrorReqs = 0;
+    function strictServe(etag) {
+      return (q, res) => {
+        if (q.headers['if-range']) {
+          // RFC-strict: weak or mismatched If-Range is ignored -> full 200
+          res.writeHead(200, { 'Content-Length': buf.length, ETag: etag });
+          res.end(buf);
+          return;
+        }
+        const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+        if (m) {
+          const a = +m[1], b = +m[2];
+          res.writeHead(206, { 'Content-Length': b - a + 1, 'Content-Range': `bytes ${a}-${b}/${buf.length}`, ETag: etag });
+          res.end(buf.subarray(a, b + 1));
+          return;
+        }
+        res.writeHead(200, { 'Content-Length': buf.length, ETag: etag });
+        res.end(buf);
+      };
+    }
+    const p = http.createServer(strictServe('W/"primary-v1"'));
+    await new Promise((ok) => p.listen(0, '127.0.0.1', ok));
+    const m = http.createServer((q, res) => {
+      mirrorReqs++;
+      if (q.headers['if-range']) mirrorSawIfRange++;
+      strictServe('"mirror-v9"')(q, res);
+    });
+    await new Promise((ok) => m.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'o.bin');
+      const r = await H.runAccel([
+        `http://127.0.0.1:${p.address().port}/f.bin`,
+        '--mirror', `http://127.0.0.1:${m.address().port}/f.bin`,
+        '-o', out, '-n', '4', '--json',
+      ], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.equal(H.sha256(out), hash);
+      assert.equal(mirrorSawIfRange, 0, 'primary validator must never go to a mirror');
+      assert.ok(mirrorReqs > 0, 'mirror actually served chunks');
+      assert.ok(H.events(r.stdout).filter((e) => e.event === 'chunk-done').length >= 4, 'stayed in chunked mode (no single-stream fallback)');
+    } finally {
+      p.close();
+      m.close();
+    }
+  });
+
+  it('manifest without its partial is discarded, download restarts', { timeout: 180000 }, async () => {
+    const work = H.workdir('corr-manifest-gone');
+    const src = H.makeFile(work, 'src.bin', 40 * 1024 * 1024);
+    const srv = await H.startServer(
+      { '/f.bin': { buf: fs.readFileSync(src.path), tmp: path.join(work, 'srv.tmp') } },
+      () => ({ slowBps: 2 * 1024 * 1024 }),
+    );
+    try {
+      const out = path.join(work, 'o.bin');
+      const c = spawn('node', [H.AGENT_DLA, srv.url('/f.bin'), '-o', out, '-n', '4'], { cwd: work });
+      const closed = new Promise((r) => c.on('close', r));
+      await H.sleep(4000); // 10MB chunks at ~2MB/s: definitely mid-flight
+      c.kill();
+      await closed;
+      assert.ok(fs.existsSync(out + '.manifest.json'), 'manifest exists after kill');
+      fs.unlinkSync(out + '.partial'); // cleaner/antivirus/user removed it
+      const r = await H.runAccel([srv.url('/f.bin'), '-o', out, '-n', '4', '--json'], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.equal(H.sha256(out), src.hash, 'fresh download, no zero holes');
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('zero-byte file downloads as empty with exit 0', { timeout: 60000 }, async () => {    const work = H.workdir('corr-zero');
     const s = http.createServer((q, res) => {
       if (q.headers.range) { res.writeHead(416, { 'Content-Range': 'bytes */0' }); res.end(); }
       else { res.writeHead(200, { 'Content-Length': 0 }); res.end(); }

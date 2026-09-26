@@ -172,4 +172,11 @@ describe('security', () => {
       s.close();
     }
   });
+
+  it('--header with CR/LF is rejected at parse time', { timeout: 60000 }, async () => {
+    const work = H.workdir('sec-header-crlf');
+    const r = await H.runAccel(['http://127.0.0.1:9/x', '--header', 'X-A: a\r\nInjected: yes'], { cwd: work });
+    assert.equal(r.code, 2);
+    assert.match(r.stderr, /CR\/LF/);
+  });
 });
