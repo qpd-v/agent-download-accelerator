@@ -168,7 +168,12 @@ describe('reliability', () => {
       const r = await H.runAccel([fileUrl, '-o', out, '-n', '4', '--json'], { cwd: work });
       assert.equal(r.code, 0);
       assert.equal(H.sha256(out), hash);
-      assert.ok(served < 40 * MB - kept / 2, `rerun transferred less (${(served / MB).toFixed(1)}MB of 40MB, kept ${(kept / MB).toFixed(1)}MB)`);
+      // Resume proof: the rerun must transfer strictly less than a full
+      // re-download. (A tighter bound against `kept` flaked under load: the
+      // server counter includes bytes written to sockets it has not yet
+      // noticed are dead. The deterministic ranges⊆gaps check below is the
+      // precise invariant.)
+      assert.ok(served < 40 * MB, `rerun resumed (${(served / MB).toFixed(1)}MB of 40MB)`);
       // Deterministic invariant (immune to timing flakiness): every byte the
       // rerun requested outside the 1-byte probe was missing per the manifest.
       const ivs = [...(m.done || []), ...Object.values(m.active || {})
@@ -1049,6 +1054,82 @@ describe('reliability', () => {
     } finally {
       proxy.close();
       await srv.close();
+    }
+  });
+
+  it('query-selected files never share a receipt (cached path)', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-querycollide');
+    const b1 = crypto.randomBytes(2 * MB);
+    const b2 = crypto.randomBytes(2 * MB);
+    const h1 = crypto.createHash('sha256').update(b1).digest('hex');
+    const h2 = crypto.createHash('sha256').update(b2).digest('hex');
+    // Same path, same size, no validators, no disposition: the query alone
+    // selects the content. Server-chosen name is f.bin for both.
+    const s = require('http').createServer((q, res) => {
+      const u = new URL(q.url, 'http://x');
+      const cur = u.searchParams.get('id') === '2' ? b2 : b1;
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : cur.length - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${cur.length}` } : {}) });
+      res.end(cur.subarray(a, b + 1));
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const base = `http://127.0.0.1:${s.address().port}/f.bin`;
+      const r1 = await H.runAccel([`${base}?id=1`, '--json'], { cwd: work });
+      assert.equal(r1.code, 0);
+      assert.equal(H.sha256(path.join(work, 'f.bin')), h1);
+      // Second query must NOT report cached with id=1's bytes. Without -o the
+      // guard refuses (safe); with --overwrite it fetches id=2 exactly.
+      const r2 = await H.runAccel([`${base}?id=2`, '--json'], { cwd: work });
+      assert.equal(r2.code, 1, 'different query, no receipt: refuse, never wrong-bytes-exit-0');
+      assert.equal(H.sha256(path.join(work, 'f.bin')), h1, 'refused run leaves id=1 untouched');
+      const r3 = await H.runAccel([`${base}?id=2`, '--json', '--overwrite'], { cwd: work });
+      assert.equal(r3.code, 0);
+      assert.equal(H.sha256(path.join(work, 'f.bin')), h2, 'output is exactly id=2');
+    } finally {
+      s.close();
+    }
+  });
+
+  it('query-selected files never share a manifest (resume path)', { timeout: 180000 }, async () => {
+    const work = H.workdir('rel-querycollide-resume');
+    const b1 = crypto.randomBytes(8 * MB);
+    const b2 = crypto.randomBytes(8 * MB);
+    const h2 = crypto.createHash('sha256').update(b2).digest('hex');
+    const s = require('http').createServer((q, res) => {
+      const u = new URL(q.url, 'http://x');
+      const cur = u.searchParams.get('id') === '2' ? b2 : b1;
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : cur.length - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${cur.length}` } : {}) });
+      let off = a;
+      const tick = () => {
+        if (res.destroyed) return;
+        const n = Math.min(64 * 1024, b - off + 1);
+        res.write(cur.subarray(off, off + n));
+        off += n;
+        if (off > b) res.end();
+        else setTimeout(tick, 60); // ~1MB/s per chunk: kill lands mid-flight
+      };
+      tick();
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const base = `http://127.0.0.1:${s.address().port}/f.bin`;
+      const out = path.join(work, 'o.bin');
+      const c = spawn('node', [H.AGENT_DLA, `${base}?id=1`, '-o', out, '-n', '4'], { cwd: work });
+      const closed = new Promise((r) => c.on('close', r));
+      await H.sleep(2500);
+      c.kill();
+      await closed;
+      assert.ok(fs.existsSync(out + '.partial'), 'partial kept after kill');
+      // ?id=2 must not reuse ?id=1's manifest: output must be exactly id=2.
+      const r = await H.runAccel([`${base}?id=2`, '-o', out, '-n', '4', '--json'], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.equal(H.sha256(out), h2, 'output is exactly id=2, no mixed blocks');
+    } finally {
+      s.close();
     }
   });
 

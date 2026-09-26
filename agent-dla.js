@@ -266,11 +266,16 @@ function sanitizeUrlName(raw) {
   return base;
 }
 // Manifest/receipt identity: origin + path + size + validator. The query
-// string is excluded so a refreshed presigned URL resumes the same download.
+// string is dropped ONLY when a strong ETag proves the object identity, so a
+// refreshed presigned URL resumes the same download. Otherwise the full query
+// is part of the key: ?id=1 vs ?id=2 can select different bytes, and sharing
+// a manifest/receipt across them mixes versions with exit 0 (N1).
 function manifestKey(targetUrl, size, etag, mtime) {
   try {
     const u = new URL(String(targetUrl));
-    return `${u.origin}${u.pathname}|${size}|${etag || ''}|${mtime || ''}`;
+    const strong = !!etag && !/^W\//i.test(etag);
+    const base = strong ? `${u.origin}${u.pathname}` : `${u.origin}${u.pathname}${u.search}`;
+    return `${base}|${size}|${etag || ''}|${mtime || ''}`;
   } catch { return `${String(targetUrl)}|${size}|${etag || ''}|${mtime || ''}`; }
 }
 // Shared redirect policy: capped chain, http(s) only, no https->http downgrade.

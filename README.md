@@ -94,8 +94,9 @@ strings, and fragments; `--redact` extends that to human logs.
   (`.agent-dla/receipts/<name>.json`, one file per output, atomic writes);
   reruns trust size+receipt (or `--sha256`), never size alone. Parallel runs
   into one directory are safe; a corrupt receipt affects only its own file.
-  Resume identity
-  ignores URL query strings so refreshed presigned URLs resume the same file.
+  Resume identity ignores URL query strings only when a strong ETag proves
+  the object (so refreshed presigned URLs resume); otherwise the full query
+  is part of the identity, so `?id=1` vs `?id=2` never share a manifest.
   A republished file (validator change) restarts clean instead of mixing versions.
 - Each mirror must byte-match first- and last-1KB samples of the primary
   before serving chunks; mismatches are evicted (warns without `--sha256`).
