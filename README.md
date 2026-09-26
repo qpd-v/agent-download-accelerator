@@ -2,9 +2,10 @@
 
 Node.js CLI that downloads one file over many parallel connections. Splits the
 file into byte-range chunks, downloads them concurrently (optionally spread
-across mirrors and proxies), then merges. Failed chunks requeue with backoff;
-completed parts persist so rerunning resumes. Pure JavaScript, no native
-dependencies. Requires Node >= 18.
+across mirrors and proxies) straight into place, then verifies. Failed chunks
+requeue with backoff; a manifest + partial file persist progress so rerunning
+resumes with byte-level granularity — even mid-chunk bytes survive kills. Pure
+JavaScript, no native dependencies. Requires Node >= 18.
 
 ## Install
 
@@ -33,11 +34,15 @@ Always quote URLs in PowerShell (bare `&` breaks parsing).
 | `--dir <folder>` | download into this folder (created if needed) |
 | `--list <file>` | batch mode: one URL per line (`#` comments) |
 | `--config <file>` | config file (default: `./agent-dla.json` if present) |
-| `-n, --connections <n>` | parallel connections, 1-128 (default 8; 16-32 for throttled hosts) |
-| `-p, --proxies <file>` | proxy list (default: `./proxies.txt` if present) |
-| `--mirror <url>` | identical file on another host (repeatable; chunks round-robin) |
-| `--timeout/--retries/--max-retries` | per-request ms / attempts per round / requeue rounds per chunk (default 100, max 1000) |
+| `-n, --connections <n>` | parallel connections, 1-128 (default 8; 16-32 for throttled hosts; at most 32 transfer concurrently) |
+| `-p, --proxies <file>` | proxy list (default: `./proxies.txt` if present; bare `ip:port` lines accepted) |
+| `--mirror <url>` | identical file on another host (repeatable; bad mirrors are evicted per run) |
+| `--timeout/--retries/--max-retries` | per-request ms / attempts per round / requeue rounds per chunk (default 100, max 1000; 0 = single attempt) |
+| `--deadline <ms>` | abort the whole download after this long (0 = none) |
+| `--header "Name: value"` | extra request header, e.g. bearer tokens (repeatable; dropped on cross-origin redirect; never override Range) |
 | `--sha256/--expect-size/--max-size/--expect-type` | integrity and safety guards (bad output is deleted) |
+| `--allow-html` | save text/html responses instead of refusing |
+| `--overwrite` | allow overwriting an existing file that has a server-chosen name (explicit `-o` always allows) |
 | `-k, --insecure` | allow self-signed certs (target connections only) |
 | `--no-auto-refresh` | never auto-refresh the proxy list |
 | `--redact` | redact URL queries/credentials in human logs too |
@@ -64,17 +69,30 @@ strings, and fragments; `--redact` extends that to human logs.
 
 ## Safety
 
-- Redirects are capped at 10 hops, non-HTTP targets refused, https-to-http
+- Every chunk response must be 206 with a matching Content-Range and exact
+  byte count; the final size is always checked. A wrong file with exit 0 is
+  treated as the worst possible outcome.
+- Path-scoped errors: a failure from one proxy or mirror evicts that path;
+  only the direct primary can fail the file. Expired signed links (401/403/410
+  from a redirect) trigger a re-probe of the original URL. `If-Range`
+  validators guard against the file changing mid-download.
+- Redirects are capped at 10 hops, non-HTTP targets and https-to-http
   downgrades refused.
-- Server filenames that collide with tool files (`proxies.txt`,
-  `agent-dla.json`, ...) are refused unless `-o` is given.
+- Server-chosen filenames are sanitized (no traversal, no dotfiles, no
+  tool-file collisions) and never overwrite an existing file unless `-o` or
+  `--overwrite` is given. Batch collisions get unique `(1)` suffixed names.
 - `--list` lines must be valid http(s) URLs or they are skipped without retries.
+- Probing has its own small budget; DNS and local filesystem errors fail fast.
+- `harvestScript`/`insecure` are only honored from an explicit `--config` —
+  a config file sitting in the working directory cannot run code or disable TLS.
 
 ## Config file (`agent-dla.json`)
 
 Defaults for connections, proxies, mirrors, outputDir, timeout, retries,
-maxRetries, harvestTimeout, harvestScript, json, insecure, redact,
-autoRefresh. CLI flags override it.
+maxRetries, deadline, harvestTimeout, harvestScript, json, insecure, redact,
+overwrite, allowHtml, autoRefresh. CLI flags override it. Note:
+`harvestScript` and `insecure` in an auto-loaded `./agent-dla.json` are
+ignored with a warning — pass `--config` to allow them.
 
 ## Tests
 

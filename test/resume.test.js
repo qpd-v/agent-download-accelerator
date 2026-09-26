@@ -19,8 +19,10 @@ describe('resume', () => {
       await H.sleep(2500);
       child.kill(); // hard kill: no handlers run (Windows TerminateProcess)
       await new Promise((r) => child.on('close', r));
-      const parts = path.join(work, 'out.bin.parts');
-      assert.ok(fs.existsSync(parts), 'parts dir kept after kill');
+      const parts = path.join(work, 'out.bin.partial');
+      const manifest = path.join(work, 'out.bin.manifest.json');
+      assert.ok(fs.existsSync(parts), 'partial kept after kill');
+      assert.ok(fs.existsSync(manifest), 'manifest kept after kill');
       const r = await H.runAccel([srv2.url('/f.bin'), '-o', out, '-n', '4', '--json'], { cwd: work });
       assert.equal(r.code, 0);
       assert.equal(H.sha256(out), src.hash);
@@ -42,7 +44,8 @@ describe('resume', () => {
       await H.sleep(2500);
       child.kill();
       await new Promise((r) => child.on('close', r));
-      assert.ok(fs.existsSync(out + '.parts'), 'parts kept');
+      assert.ok(fs.existsSync(out + '.partial'), 'partial kept');
+      assert.ok(fs.existsSync(out + '.manifest.json'), 'manifest kept');
       const r = await H.runAccel([srv.url('/f.bin'), '-o', out, '-n', '2', '--json'], { cwd: work });
       assert.equal(r.code, 0);
       assert.equal(H.sha256(out), src.hash);

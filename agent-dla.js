@@ -10,6 +10,9 @@ const { HttpProxyAgent } = require('http-proxy-agent');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const { SocksProxyAgent } = require('socks-proxy-agent');
 const { spawn } = require('child_process');
+const { pipeline } = require('stream');
+const { promisify } = require('util');
+const pipelineAsync = promisify(pipeline);
 
 function collect(v, arr) { arr.push(v); return arr; }
 
@@ -21,20 +24,24 @@ program
   .option('--dir <folder>', 'download into this folder (created if needed)')
   .option('--list <file>', 'batch mode: one URL per line (# comments allowed)')
   .option('--config <file>', 'config file (default: ./agent-dla.json if present)')
-  .option('-n, --connections <n>', 'parallel connections (chunks), default 8, max 128', '8')
+  .option('-n, --connections <n>', 'parallel connections (chunks), default 8, max 128 (at most 32 transfer concurrently)', '8')
   .option('-p, --proxies <file>', 'proxy list file (default: ./proxies.txt if present)')
   .option('--mirror <url>', 'mirror URL serving the identical file (repeatable)', collect, [])
   .option('--timeout <ms>', 'per-request timeout ms', '15000')
   .option('--retries <n>', 'retries per chunk', '3')
   .option('--max-retries <n>', 'requeue rounds per chunk before aborting (parts are kept, rerun resumes)', '100')
+  .option('--deadline <ms>', 'abort the whole download after this long (0 = none)')
   .option('--sha256 <hex>', 'verify file sha256 after download (bad output is deleted)')
   .option('--expect-size <size>', 'fail if final size differs (e.g. 10MB, 1.5GB, 1048576)')
   .option('--max-size <size>', 'refuse before / abort above this size')
   .option('--expect-type <mime>', 'fail if server content-type differs')
   .option('-k, --insecure', 'allow self-signed certs')
   .option('--no-auto-refresh', 'never auto-refresh the proxy list (default: refresh once when empty or all dead)')
+  .option('--overwrite', 'allow overwriting an existing file chosen by the server (explicit -o always allows)')
+  .option('--allow-html', 'save text/html responses instead of refusing')
   .option('--json', 'newline-delimited JSON events on stdout (human logs go to stderr)')
   .option('--redact', 'redact URL queries/credentials in human logs too (JSON events are always redacted)')
+  .option('--header <h>', 'extra request header "Name: value" (repeatable; dropped on cross-origin redirect)', collect, [])
   .exitOverride();
 program.configureOutput({
   writeOut: (str) => (process.argv.includes('--json') ? process.stderr : process.stdout).write(str),
@@ -52,25 +59,43 @@ const opts = program.opts();
 let HARVEST_TIMEOUT_MS = 0;
 let HARVEST_SCRIPT = '';
 function loadConfig() {
+  const explicit = !!opts.config;
   const p = opts.config || (fs.existsSync(path.resolve('agent-dla.json')) ? path.resolve('agent-dla.json') : null);
   if (!p) return;
   let cfg;
   try { cfg = JSON.parse(fs.readFileSync(p, 'utf8')); }
   catch (e) { console.error(`bad config ${p}: ${e.message}`); process.exit(2); }
   const cli = (name) => program.getOptionValueSource(name) === 'cli';
-  if (!cli('connections') && cfg.connections) opts.connections = String(cfg.connections);
-  if (!cli('timeout') && cfg.timeout) opts.timeout = String(cfg.timeout);
-  if (!cli('retries') && cfg.retries) opts.retries = String(cfg.retries);
-  if (!cli('maxRetries') && cfg.maxRetries) opts.maxRetries = String(cfg.maxRetries);
-  if (!cli('proxies') && cfg.proxies) opts.proxies = cfg.proxies;
+  // Sensitive keys are only honored from an explicit --config. An agent-dla.json
+  // sitting in the working directory could come from an untrusted checkout.
+  const allowSensitive = explicit;
+  const blocked = [];
+  if (!cli('connections') && cfg.connections !== undefined) opts.connections = String(cfg.connections);
+  if (!cli('timeout') && cfg.timeout !== undefined) opts.timeout = String(cfg.timeout);
+  if (!cli('retries') && cfg.retries !== undefined) opts.retries = String(cfg.retries);
+  if (!cli('maxRetries') && cfg.maxRetries !== undefined) opts.maxRetries = String(cfg.maxRetries);
+  if (!cli('deadline') && cfg.deadline !== undefined) opts.deadline = String(cfg.deadline);
+  if (!cli('proxies') && cfg.proxies) {
+    opts.proxies = (explicit && !path.isAbsolute(cfg.proxies)) ? path.join(path.dirname(p), cfg.proxies) : cfg.proxies;
+  }
   if (!cli('mirror') && Array.isArray(cfg.mirrors)) opts.mirror = cfg.mirrors;
   if (!cli('dir') && cfg.outputDir) opts.dir = cfg.outputDir;
   if (!cli('json') && cfg.json) opts.json = true;
-  if (!cli('insecure') && cfg.insecure) opts.insecure = true;
+  if (!cli('insecure') && cfg.insecure) {
+    if (allowSensitive) opts.insecure = true;
+    else blocked.push('insecure');
+  }
   if (program.getOptionValueSource('autoRefresh') !== 'cli' && (cfg.autoRefresh === false || cfg.noAutoRefresh === true)) opts.autoRefresh = false;
   if (cfg.harvestTimeout) HARVEST_TIMEOUT_MS = parseInt(cfg.harvestTimeout, 10) || 0;
-  if (cfg.harvestScript) HARVEST_SCRIPT = String(cfg.harvestScript);
+  if (cfg.harvestScript) {
+    if (allowSensitive) {
+      HARVEST_SCRIPT = path.isAbsolute(cfg.harvestScript) ? cfg.harvestScript : path.join(path.dirname(p), cfg.harvestScript);
+    } else blocked.push('harvestScript');
+  }
   if (program.getOptionValueSource('redact') !== 'cli' && cfg.redact) opts.redact = true;
+  if (program.getOptionValueSource('overwrite') !== 'cli' && cfg.overwrite) opts.overwrite = true;
+  if (program.getOptionValueSource('allowHtml') !== 'cli' && cfg.allowHtml) opts.allowHtml = true;
+  if (blocked.length) console.error(`WARNING: ignoring sensitive config keys from auto-loaded ${p} (use --config to allow): ${blocked.join(', ')}`);
 }
 loadConfig();
 function loadList(file) {
@@ -82,11 +107,22 @@ function loadList(file) {
 
 const MAX_REDIRECTS = 10;
 const MAX_PROXIES = 2048;
-const CONNECTIONS = Math.min(Math.max(parseInt(opts.connections, 10) || 8, 1), 128);
+function numOpt(v, def, min, max) {
+  if (v === undefined || v === null || v === '') return def;
+  const n = parseInt(v, 10);
+  if (isNaN(n)) return def;
+  return Math.min(Math.max(n, min), max);
+}
+const CONNECTIONS = numOpt(opts.connections, 8, 1, 128);
 const BENCH_CONC = Math.min(CONNECTIONS, 32);
-const TIMEOUT = parseInt(opts.timeout, 10) || 15000;
-const RETRIES = parseInt(opts.retries, 10) || 3;
-const MAX_RETRIES = Math.min(Math.max(parseInt(opts.maxRetries, 10) || 100, 1), 1000);
+const TIMEOUT = numOpt(opts.timeout, 15000, 1, 3600000);
+const RETRIES = numOpt(opts.retries, 3, 0, 64);
+const MAX_RETRIES = numOpt(opts.maxRetries, 100, 0, 1000);
+const DEADLINE_MS = numOpt(opts.deadline, 0, 0, 86400000);
+let DL_AT = 0; // per-file deadline timestamp, set in the batch loop
+function checkDeadline() {
+  if (DL_AT && Date.now() > DL_AT) { const e = new Error('deadline exceeded'); e.fatal = true; throw e; }
+}
 function parseSize(s) {
   if (!s) return 0;
   const m = /^\s*([\d.]+)\s*([kmgt]?b?)?\s*$/i.exec(s);
@@ -99,6 +135,18 @@ if (EXPECT_SHA && !/^[0-9a-f]{64}$/.test(EXPECT_SHA)) { console.error('bad --sha
 const EXPECT_SIZE = parseSize(opts.expectSize);
 const MAX_SIZE = parseSize(opts.maxSize);
 const EXPECT_TYPE = (opts.expectType || '').trim() || null;
+const ALLOW_HTML = !!opts.allowHtml;
+const usedOutputs = new Set(); // outputs claimed by this process (batch uniqueness)
+const CUSTOM_HEADERS = {};
+for (const h of (opts.header || [])) {
+  const i = String(h).indexOf(':');
+  if (i <= 0) { console.error(`bad --header (want "Name: value"): ${h}`); process.exit(2); }
+  const name = h.slice(0, i).trim();
+  const value = h.slice(i + 1).trim();
+  if (/^(range|user-agent|if-range)$/i.test(name)) { console.error(`--header must not override ${name}`); process.exit(2); }
+  if (!value) { console.error(`bad --header (empty value): ${h}`); process.exit(2); }
+  CUSTOM_HEADERS[name] = value;
+}
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 function backoffMs(fails) {
   return Math.min(1000 * 2 ** Math.min(fails, 5), 30000) + Math.random() * 1000;
@@ -144,6 +192,25 @@ function validTarget(t) {
     return u.protocol === 'http:' || u.protocol === 'https:';
   } catch { return false; }
 }
+// Server-controlled names are hostile input: decode, de-dot, no separators.
+function cleanName(name) {
+  let out = '';
+  for (const ch of String(name)) {
+    const c = ch.codePointAt(0);
+    if (c < 32 || c === 127 || '\\/;:*?"<>|'.includes(ch)) out += '_';
+    else out += ch;
+  }
+  return out;
+}
+function sanitizeUrlName(raw) {
+  let base = String(raw || '');
+  try { base = decodeURIComponent(base); } catch {}
+  base = base.split('/').pop().split('\\').pop() || '';
+  base = base.replace(/^[\s.]+/, '');
+  base = cleanName(base).replace(/[.\s]+$/, '').slice(0, 200);
+  if (!base || base === '.' || base === '..') return 'download.bin';
+  return base;
+}
 // Shared redirect policy: capped chain, http(s) only, no https->http downgrade.
 function redirectTarget(res, base, depth) {
   if (![301, 302, 303, 307, 308].includes(res.statusCode) || !res.headers.location) return null;
@@ -159,6 +226,7 @@ function redirectTarget(res, base, depth) {
 // off per Retry-After then continue. transient: rotate proxy and retry.
 function classifyErr(e) {
   if (e && (e.fatal || e.code === 'SPLIT')) return e.code === 'SPLIT' ? 'split' : 'fatal';
+  if (e && /^(EISDIR|EACCES|ENOSPC|EPERM|EROFS)$/.test(e.code || '')) return 'fatal';
   const st = e && e.status;
   if (st === 429 || st === 503) return 'throttle';
   if (st === 408) return 'transient';
@@ -172,7 +240,7 @@ function say(msg) { if (JSON_MODE) console.error(msg); else console.log(msg); }
 function warn(msg) { emit({ event: 'warning', message: msg }); console.error((JSON_MODE ? '' : 'WARNING: ') + msg); }
 let shutdownHandler = null;
 process.on('SIGINT', () => { if (shutdownHandler) shutdownHandler('SIGINT'); else process.exit(130); });
-process.on('SIGTERM', () => { if (shutdownHandler) shutdownHandler('SIGTERM'); else process.exit(130); });
+process.on('SIGTERM', () => { if (shutdownHandler) shutdownHandler('SIGTERM'); else process.exit(143); });
 const TLS_INSECURE = opts.insecure ? { rejectUnauthorized: false } : {};
 
 function loadProxies(file) {
@@ -187,7 +255,8 @@ function loadProxiesSoft(file) {
     if (!file || !fs.existsSync(path.resolve(file))) return [];
     return fs.readFileSync(path.resolve(file), 'utf8').split(/\r?\n/)
       .map((l) => l.trim())
-      .filter((l) => l && !l.startsWith('#'));
+      .filter((l) => l && !l.startsWith('#'))
+      .map((l) => (/^[^:/\s]+:\d{1,5}$/.test(l) ? `http://${l}` : l));
   } catch { return []; }
 }
 
@@ -206,7 +275,7 @@ function runHarvest(outFile) {
   const childEnv = { ...process.env };
   delete childEnv.NODE_TLS_REJECT_UNAUTHORIZED;
   return new Promise((resolve) => {
-    const child = spawn('node', [script, outFile], { timeout: timeoutMs, env: childEnv });
+    const child = spawn(process.execPath, [script, outFile], { timeout: timeoutMs, env: childEnv });
     child.stdout.on('data', (d) => process.stderr.write(d));
     child.stderr.on('data', (d) => process.stderr.write(d));
     let done = false;
@@ -224,6 +293,14 @@ function looksLikeProxyList(file) {
   return lines.every((l) => /^(?:[a-zA-Z][a-zA-Z0-9+.-]*:\/\/)?(?:[^@/\s]+@)?[^/\s:]+:\d{1,5}$/.test(l));
 }
 
+const HARVEST_COOLDOWN_MS = 6 * 3600 * 1000;
+function harvestMarkerTime(file) {
+  try {
+    const m = /^# agent-dla auto-refresh (\S+)/.exec(fs.readFileSync(path.resolve(file), 'utf8').split('\n')[0]);
+    return m ? Date.parse(m[1]) : NaN;
+  } catch { return NaN; }
+}
+
 async function refreshProxyList(reason) {
   autoRefreshed = true;
   const outFile = proxySource;
@@ -235,14 +312,33 @@ async function refreshProxyList(reason) {
     proxyIdx = 0;
     return;
   }
+  const marked = harvestMarkerTime(outFile);
+  if (!isNaN(marked) && Date.now() - marked < HARVEST_COOLDOWN_MS) {
+    say('Proxy list was refreshed recently, not re-harvesting — continuing direct.');
+    emit({ event: 'proxies-refresh', phase: 'done', reason, file: outFile, candidates: 0, ok: false, cooldown: true });
+    PROXIES = [];
+    proxyIdx = 0;
+    return;
+  }
   try {
-    if (fs.existsSync(outFile) && fs.statSync(outFile).size > 0) fs.copyFileSync(outFile, `${outFile}.bak`);
+    if (fs.existsSync(outFile) && fs.statSync(outFile).size > 0 && !fs.existsSync(`${outFile}.bak`)) {
+      fs.copyFileSync(outFile, `${outFile}.bak`);
+    }
   } catch {}
   emit({ event: 'proxies-refresh', phase: 'start', reason, file: outFile });
   say(`Proxy list ${reason === 'empty' ? 'is empty' : 'has no working proxies'} — refreshing (${outFile})...`);
   const ok = await runHarvest(outFile);
   PROXIES = ok ? loadProxiesSoft(outFile) : []; // failed harvest: go direct, don't re-bench the known-dead list
   proxyIdx = 0;
+  if (ok) {
+    try {
+      const abs = path.resolve(outFile);
+      const cur = fs.readFileSync(abs, 'utf8');
+      if (!cur.startsWith('# agent-dla auto-refresh')) {
+        fs.writeFileSync(abs, `# agent-dla auto-refresh ${new Date().toISOString()}\n${cur}`);
+      }
+    } catch {}
+  }
   emit({ event: 'proxies-refresh', phase: 'done', reason, file: outFile, candidates: PROXIES.length, ok });
   say(ok ? `Refresh found ${PROXIES.length} candidate(s), re-checking...` : 'Refresh failed, continuing direct.');
 }
@@ -275,8 +371,9 @@ function filenameFromDisposition(headers) {
   if (!m) return null;
   let name = m[1].trim();
   try { name = decodeURIComponent(name); } catch {}
-  name = name.replace(/[ -\\/;:*?"<>|]/g, '_').slice(0, 200);
-  return name || null;
+  name = cleanName(name).replace(/^[\s.]+/, '').replace(/[.\s]+$/, '').slice(0, 200);
+  if (!name || name === '.' || name === '..') return null;
+  return name;
 }
 
 function mimeOf(headers) { return String(headers['content-type'] || '').split(';')[0].trim() || null; }
@@ -292,14 +389,15 @@ function fmtSize(b) {
   return b + ' bytes';
 }
 
-function agentFor(proxyUrl, targetIsHttps) {
+function agentFor(proxyUrl, targetIsHttps, timeout = TIMEOUT) {
   if (!proxyUrl) return targetIsHttps ? directHttpsAgent : directHttpAgent;
   const low = proxyUrl.toLowerCase();
-  if (low.startsWith('socks')) return new SocksProxyAgent(proxyUrl, { timeout: TIMEOUT, ...TLS_INSECURE });
-  return targetIsHttps ? new HttpsProxyAgent(proxyUrl, { timeout: TIMEOUT, ...TLS_INSECURE }) : new HttpProxyAgent(proxyUrl, { timeout: TIMEOUT, ...TLS_INSECURE });
+  if (low.startsWith('socks')) return new SocksProxyAgent(proxyUrl, { timeout, ...TLS_INSECURE });
+  return targetIsHttps ? new HttpsProxyAgent(proxyUrl, { timeout, ...TLS_INSECURE }) : new HttpProxyAgent(proxyUrl, { timeout, ...TLS_INSECURE });
 }
 
-function requestOnce(urlStr, headers, proxyUrl, depth = 0) {
+function requestOnce(urlStr, headers, proxyUrl, depth = 0, custom = null) {
+  if (custom === null) custom = CUSTOM_HEADERS;
   return new Promise((resolve, reject) => {
     const u = new URL(urlStr);
     const isHttps = u.protocol === 'https:';
@@ -307,7 +405,7 @@ function requestOnce(urlStr, headers, proxyUrl, depth = 0) {
     const agent = agentFor(proxyUrl, isHttps);
     const req = lib.request(urlStr, {
       method: 'GET',
-      headers: { 'User-Agent': 'agent-dla/1.0', ...headers },
+      headers: { 'User-Agent': 'agent-dla/1.0', ...custom, ...headers },
       agent,
       timeout: TIMEOUT,
       ...TLS_INSECURE,
@@ -317,7 +415,8 @@ function requestOnce(urlStr, headers, proxyUrl, depth = 0) {
       catch (e) { res.resume(); reject(e); return; }
       if (next) {
         res.resume();
-        resolve(requestOnce(next, headers, proxyUrl, depth + 1).then((r) => ({ ...r, finalUrl: r.finalUrl || next })));
+        const sameOrigin = new URL(next).origin === new URL(urlStr).origin;
+        resolve(requestOnce(next, headers, proxyUrl, depth + 1, sameOrigin ? custom : {}).then((r) => ({ ...r, finalUrl: r.finalUrl || next })));
         return;
       }
       // Probe only needs status/headers: cap the buffered body so a server
@@ -340,55 +439,92 @@ function requestOnce(urlStr, headers, proxyUrl, depth = 0) {
   });
 }
 
+const PROBE_RETRIES = 5;
+function infoFromProbe(r, url) {
+  return { size: 0, range: false, finalUrl: r.finalUrl || url, filename: filenameFromDisposition(r.headers), html: isHtmlType(r.headers), mime: mimeOf(r.headers), etag: r.headers.etag || null, mtime: r.headers['last-modified'] || null };
+}
 async function getFileInfo(url) {
-  const attempts = Math.min(Math.max(1, PROXIES.length || 1), 32);
-  const tried = new Set();
+  // Direct first: fastest signal with no proxy delay. Proxies are tried when
+  // direct fails; a direct 4xx is remembered and becomes fatal only if no
+  // proxy path succeeds (it usually means the file itself is gone).
+  const order = [null, ...PROXIES.slice(0, 32)];
+  const rounds = MAX_RETRIES === 0 ? 1 : PROBE_RETRIES;
   let lastErr = new Error('probe failed');
-  for (let i = 0; i < attempts; i++) {
-    const proxy = nextProxy();
-    if (tried.has(proxy)) break;
-    tried.add(proxy);
-    let r;
-    try {
-      r = await requestOnce(url, { Range: 'bytes=0-0' }, proxy);
-    } catch (e) { lastErr = e; continue; }
-    if (r.status === 206) {
-      const cr = r.headers['content-range'] || '';
-      const total = parseInt((cr.split('/')[1] || ''), 10);
-      if (total > 0) return { size: total, range: true, finalUrl: r.finalUrl || url, filename: filenameFromDisposition(r.headers), html: isHtmlType(r.headers), mime: mimeOf(r.headers) };
+  let directErr = null;
+  const probeDead = new Set();
+  for (let round = 0; round < rounds; round++) {
+    checkDeadline();
+    for (const proxy of order) {
+      if (proxy !== null && probeDead.has(proxy)) continue;
+      let r;
+      try {
+        r = await requestOnce(url, { Range: 'bytes=0-0' }, proxy);
+      } catch (e) {
+        lastErr = e;
+        if (e && e.fatal) throw e;
+        if (e && e.code === 'ENOTFOUND' && round >= 1) { e.fatal = true; throw e; }
+        if (proxy !== null) probeDead.add(proxy);
+        continue; // transient: next path
+      }
+      if (r.status === 206) {
+        const cr = parseContentRange(r.headers['content-range']);
+        if (cr && cr.total > 0) return { ...infoFromProbe(r, url), size: cr.total, range: true };
+        return infoFromProbe(r, url); // unknown total: single-stream fallback
+      }
+      if (r.status === 200) {
+        const len = parseInt(r.headers['content-length'] || '0', 10);
+        return { ...infoFromProbe(r, url), size: len || 0 };
+      }
+      if (r.status === 416) {
+        // e.g. zero-byte file: retry the probe without Range once
+        try {
+          const r2 = await requestOnce(url, {}, proxy);
+          if (r2.status === 200) {
+            const len = parseInt(r2.headers['content-length'] || '0', 10);
+            return { ...infoFromProbe(r2, url), size: len || 0 };
+          }
+        } catch (e) { lastErr = e; continue; }
+      }
+      lastErr = new Error(`probe via ${redactProxy(proxy)}: HTTP ${r.status}`);
+      if (proxy === null && r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429) {
+        directErr = lastErr;
+        directErr.fatal = true;
+      }
+      // proxy-path 4xx only condemns that path; other paths are still tried
     }
-    if (r.status === 200) {
-      const len = parseInt(r.headers['content-length'] || '0', 10);
-      return { size: len || 0, range: false, finalUrl: r.finalUrl || url, filename: filenameFromDisposition(r.headers), html: isHtmlType(r.headers), mime: mimeOf(r.headers) };
-    }
-    lastErr = new Error(`probe via ${redactProxy(proxy)}: HTTP ${r.status}`);
+    if (round + 1 < rounds) await sleep(Math.min(1000 * 2 ** round, 8000));
+    if (directErr && order.length <= 1) break; // direct-only: no other path can save it
   }
-  // last resort: direct probe so dead proxies can't block the download
-  try {
-    const r = await requestOnce(url, { Range: 'bytes=0-0' }, null);
-    if (r.status === 206) {
-      const cr = r.headers['content-range'] || '';
-      const total = parseInt((cr.split('/')[1] || ''), 10);
-      if (total > 0) return { size: total, range: true, finalUrl: r.finalUrl || url, filename: filenameFromDisposition(r.headers), html: isHtmlType(r.headers), mime: mimeOf(r.headers) };
-    }
-    if (r.status === 200) {
-      const len = parseInt(r.headers['content-length'] || '0', 10);
-      return { size: len || 0, range: false, finalUrl: r.finalUrl || url, filename: filenameFromDisposition(r.headers), html: isHtmlType(r.headers), mime: mimeOf(r.headers) };
-    }
-    lastErr = new Error(`direct probe: HTTP ${r.status}`);
-  } catch (e) { lastErr = e; }
-  throw lastErr;
+  throw directErr || lastErr;
 }
 
-function downloadChunkToFile(url, start, end, partPath, proxyUrl, onProgress, token, depth = 0) {
+function parseContentRange(v) {
+  const m = /^\s*bytes\s+(\d+)-(\d+)\/(\d+|\*)\s*$/i.exec(String(v || ''));
+  if (!m) return null;
+  return { start: parseInt(m[1], 10), end: parseInt(m[2], 10), total: m[3] === '*' ? NaN : parseInt(m[3], 10) };
+}
+function writeAll(fd, buf, pos) {
+  let off = 0;
+  while (off < buf.length) {
+    const n = fs.writeSync(fd, buf, off, buf.length - off, pos + off);
+    if (n <= 0) throw new Error('short write');
+    off += n;
+  }
+}
+// Streaming range download straight into the shared output fd at absolute
+// positions. No part files: received bytes are already correctly placed,
+// so splits and kills never discard or misplace data.
+function downloadRange(url, start, end, fd, proxyUrl, onProgress, token, depth = 0, expectTotal = 0, ifRange = null, custom = null) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const isHttps = u.protocol === 'https:';
     const lib = isHttps ? https : http;
     const agent = agentFor(proxyUrl, isHttps);
+    const rangeHeaders = { 'User-Agent': 'agent-dla/1.0', ...(custom || {}), Range: `bytes=${start}-${end}` };
+    if (ifRange) rangeHeaders['If-Range'] = ifRange;
     const req = lib.request(url, {
       method: 'GET',
-      headers: { 'User-Agent': 'agent-dla/1.0', Range: `bytes=${start}-${end}` },
+      headers: rangeHeaders,
       agent,
       timeout: TIMEOUT,
       ...TLS_INSECURE,
@@ -398,21 +534,58 @@ function downloadChunkToFile(url, start, end, partPath, proxyUrl, onProgress, to
       catch (e) { res.resume(); reject(e); return; }
       if (next) {
         res.resume();
-        downloadChunkToFile(next, start, end, partPath, proxyUrl, onProgress, token, depth + 1).then(resolve, reject);
+        const sameOrigin = new URL(next).origin === new URL(url).origin;
+        downloadRange(next, start, end, fd, proxyUrl, onProgress, token, depth + 1, expectTotal, ifRange, sameOrigin ? custom : null).then(resolve, reject);
         return;
       }
-      if (res.statusCode !== 206 && res.statusCode !== 200) {
+      const expected = end - start + 1;
+      if (res.statusCode === 412) {
         res.resume();
-        reject(httpError(res.statusCode, res.headers, `${start}-${end}`));
+        const e = new Error('file changed mid-download (If-Range mismatch)');
+        e.fatal = true;
+        reject(e);
         return;
       }
-      const ws = fs.createWriteStream(partPath);
-      let done = 0;
-      res.on('data', (c) => { done += c.length; if (onProgress) onProgress(c.length); });
-      res.pipe(ws);
-      ws.on('finish', () => resolve(done));
-      ws.on('error', reject);
-      res.on('error', reject);
+      if (res.statusCode !== 206) {
+        res.resume();
+        const e = httpError(res.statusCode, res.headers, `${start}-${end}`);
+        if (res.statusCode === 200) { e.message += ' (server ignored Range for chunk)'; e.fatal = true; }
+        reject(e);
+        return;
+      }
+      const cr = parseContentRange(res.headers['content-range']);
+      if (!cr || cr.start !== start || cr.end !== end || (expectTotal > 0 && cr.total !== expectTotal)) {
+        res.resume();
+        const e = new Error(`Content-Range mismatch for chunk ${start}-${end}: got ${res.headers['content-range'] || 'none'}`);
+        e.fatal = true;
+        reject(e);
+        return;
+      }
+      let pos = start;
+      let received = 0;
+      let failed = false;
+      const fail = (e) => { if (!failed) { failed = true; try { req.destroy(); } catch {} reject(e); } };
+      res.on('data', (c) => {
+        if (failed) return;
+        if (pos + c.length > end + 1) {
+          const e = new Error(`chunk ${start}-${end} overran`);
+          e.fatal = true;
+          fail(e);
+          return;
+        }
+        try {
+          writeAll(fd, c, pos);
+        } catch (e) { try { res.destroy(); } catch {} fail(e); return; }
+        pos += c.length;
+        received += c.length;
+        if (onProgress) onProgress(c.length);
+      });
+      res.on('end', () => {
+        if (failed) return;
+        if (received !== expected) { fail(new Error(`short chunk ${start}-${end}: got ${received} of ${expected}`)); return; }
+        resolve(received);
+      });
+      res.on('error', fail);
     });
     if (token) token.req = req;
     const timeoutErr = new Error('timeout');
@@ -422,7 +595,8 @@ function downloadChunkToFile(url, start, end, partPath, proxyUrl, onProgress, to
     req.end();
   });
 }
-async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0) {
+async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0, custom = null) {
+  if (custom === null) custom = CUSTOM_HEADERS;
   const u = new URL(url);
   const isHttps = u.protocol === 'https:';
   const lib = isHttps ? https : http;
@@ -438,8 +612,8 @@ async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0) {
     const req = lib.request(url, {
       method: 'GET',
       headers: start > 0
-        ? { 'User-Agent': 'agent-dla/1.0', Range: `bytes=${start}-` }
-        : { 'User-Agent': 'agent-dla/1.0' },
+        ? { 'User-Agent': 'agent-dla/1.0', ...custom, Range: `bytes=${start}-` }
+        : { 'User-Agent': 'agent-dla/1.0', ...custom },
       agent: agentFor(proxyUrl, isHttps),
       timeout: TIMEOUT,
       ...TLS_INSECURE,
@@ -449,7 +623,8 @@ async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0) {
       catch (e) { res.resume(); reject(e); return; }
       if (next) {
         res.resume();
-        downloadSingle(next, outPath, proxyUrl, totalSize, depth + 1).then(resolve, reject);
+        const sameOrigin = new URL(next).origin === new URL(url).origin;
+        downloadSingle(next, outPath, proxyUrl, totalSize, depth + 1, sameOrigin ? custom : {}).then(resolve, reject);
         return;
       }
       if (start > 0 && res.statusCode === 200) {
@@ -473,7 +648,7 @@ async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0) {
           chunks_done: total && done >= total ? 1 : 0, chunks_total: 1, active: 1, retries: 0, splits: 0,
         });
       };
-      const timer = setInterval(() => { if (JSON_MODE) emitProg(); else draw(); }, JSON_MODE ? 1000 : 250);
+      const timer = setInterval(() => { if (JSON_MODE) emitProg(); else if (process.stdout.isTTY) draw(); }, JSON_MODE ? 1000 : 250);
       if (JSON_MODE) emitProg();
       res.on('data', (c) => {
         done += c.length;
@@ -484,12 +659,10 @@ async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0) {
           try { res.destroy(); } catch {}
         }
       });
-      res.pipe(ws);
       let settled = false;
-      ws.on('finish', () => { if (settled) return; settled = true; clearInterval(timer); if (JSON_MODE) emitProg(); else { draw(); process.stdout.write('\n'); } resolve(); });
-      const fail = (e) => { if (settled) return; settled = true; clearInterval(timer); try { ws.destroy(); } catch {} reject(e); };
-      ws.on('error', fail);
-      res.on('error', fail);
+      const finishOk = () => { if (settled) return; settled = true; clearInterval(timer); if (JSON_MODE) emitProg(); else { draw(); process.stdout.write('\n'); } resolve(); };
+      const fail = (e) => { if (settled) return; settled = true; clearInterval(timer); reject(e); };
+      pipelineAsync(res, ws).then(finishOk, fail);
     });
     const timeoutErr = new Error('timeout');
     timeoutErr.code = 'TIMEOUT';
@@ -499,8 +672,11 @@ async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0) {
   });
 }
 
-// capped fetch (maxBytes) to measure path throughput without downloading the file
-function benchFetch(urlStr, proxyUrl, maxBytes = 262144, depth = 0) {
+// capped fetch (maxBytes) to measure path throughput without downloading the file.
+// Only 206 responses with a matching Content-Range count: error pages must
+// never rank a proxy as "fast".
+function benchFetch(urlStr, proxyUrl, maxBytes = 65536, depth = 0, custom = null) {
+  if (custom === null) custom = CUSTOM_HEADERS;
   return new Promise((resolve) => {
     const t0 = Date.now();
     const finish = (bytes) => resolve({ bytes, ms: Date.now() - t0 });
@@ -510,11 +686,12 @@ function benchFetch(urlStr, proxyUrl, maxBytes = 262144, depth = 0) {
     try { u = new URL(urlStr); } catch { done(0); return; }
     const isHttps = u.protocol === 'https:';
     const lib = isHttps ? https : http;
+    const benchTimeout = Math.min(TIMEOUT, 10000);
     const req = lib.request(urlStr, {
       method: 'GET',
-      headers: { 'User-Agent': 'agent-dla/1.0', Range: `bytes=0-${maxBytes - 1}` },
-      agent: agentFor(proxyUrl, isHttps),
-      timeout: TIMEOUT,
+      headers: { 'User-Agent': 'agent-dla/1.0', ...custom, Range: `bytes=0-${maxBytes - 1}` },
+      agent: agentFor(proxyUrl, isHttps, benchTimeout),
+      timeout: benchTimeout,
       ...TLS_INSECURE,
     }, (res) => {
       let next = null;
@@ -522,9 +699,13 @@ function benchFetch(urlStr, proxyUrl, maxBytes = 262144, depth = 0) {
       catch { done(0); res.resume(); return; }
       if (next) {
         res.resume();
-        benchFetch(next, proxyUrl, maxBytes, depth + 1).then((r) => done(r.bytes));
+        const sameOrigin = new URL(next).origin === new URL(urlStr).origin;
+        benchFetch(next, proxyUrl, maxBytes, depth + 1, sameOrigin ? custom : {}).then((r) => done(r.bytes));
         return;
       }
+      if (res.statusCode !== 206) { try { res.destroy(); } catch {} done(0); return; }
+      const cr = parseContentRange(res.headers['content-range']);
+      if (!cr || cr.start !== 0) { try { res.destroy(); } catch {} done(0); return; }
       res.on('data', (c) => {
         got += c.length;
         if (got >= maxBytes) { done(got); req.destroy(); res.destroy(); }
@@ -539,14 +720,15 @@ function benchFetch(urlStr, proxyUrl, maxBytes = 262144, depth = 0) {
 }
 
 async function benchAndFilter(url) {
-  const intro = `Benchmarking ${PROXIES.length} proxies (256KB each)...`;
+  const intro = `Benchmarking ${PROXIES.length} proxies (64KB each)...`;
   if (JSON_MODE) process.stderr.write(intro); else process.stdout.write(intro);
   const d = await benchFetch(url, null);
   const dKbps = d.bytes / 1024 / Math.max(d.ms / 1000, 0.01);
   const results = [];
   const bqueue = [...PROXIES];
+  const enough = () => results.filter((r) => r.kbps >= PROXY_MIN_KBPS).length >= CONNECTIONS;
   await Promise.all(Array.from({ length: Math.min(BENCH_CONC, bqueue.length) }, async () => {
-    while (bqueue.length) {
+    while (bqueue.length && !enough()) {
       const px = bqueue.shift();
       const r = await benchFetch(url, px).catch(() => ({ bytes: 0, ms: 1 }));
       results.push({ px, kbps: r.bytes / 1024 / Math.max(r.ms / 1000, 0.01) });
@@ -591,16 +773,17 @@ async function sha256File(p) {
   return h.digest('hex');
 }
 
-// post-download verification; bad output (+parts) is deleted so a rerun starts clean
-async function verifyOutput(outPath, tmpDir) {
+// post-download verification; bad output (+manifest) is deleted so a rerun starts clean
+async function verifyOutput(outPath, manifestPath, expectSize = 0) {
   const bytes = fs.existsSync(outPath) ? fs.statSync(outPath).size : 0;
   const bad = async (msg) => {
     try { fs.unlinkSync(outPath); } catch {}
-    if (tmpDir) { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {} }
+    if (manifestPath) { try { fs.unlinkSync(manifestPath); } catch {} }
     emit({ event: 'error', scope: 'verify', message: msg });
     throw new Error(msg);
   };
   if (EXPECT_SIZE && bytes !== EXPECT_SIZE) await bad(`size mismatch: got ${fmtSize(bytes)}, expected ${fmtSize(EXPECT_SIZE)} (bad output deleted)`);
+  if (expectSize > 0 && bytes !== expectSize) await bad(`size mismatch: got ${fmtSize(bytes)}, server said ${fmtSize(expectSize)} (bad output deleted)`);
   let sha = null;
   if (EXPECT_SHA) {
     say('Verifying sha256...');
@@ -612,18 +795,12 @@ async function verifyOutput(outPath, tmpDir) {
 }
 
 async function runDownload(targetUrl) {
+  const originalTarget = targetUrl;
   let info = null;
-  for (let pf = 1; ; pf++) {
-    try { info = await getFileInfo(targetUrl); break; }
-    catch (e) {
-      const permanent = (e && e.fatal) || (/HTTP 4\d\d/.test(e.message) && !/HTTP (429|408)/.test(e.message));
-      if (permanent || pf > MAX_RETRIES) {
-        emit({ event: 'error', scope: 'probe', message: e.message });
-        throw new Error('Probe failed: ' + e.message);
-      }
-      emit({ event: 'retry', scope: 'probe', fails: pf, after_ms: Math.round(backoffMs(pf)) });
-      await backoff(pf); // transient network blip: keep trying until the file is reachable
-    }
+  try { info = await getFileInfo(targetUrl); }
+  catch (e) {
+    emit({ event: 'error', scope: 'probe', message: e.message });
+    throw new Error('Probe failed: ' + e.message);
   }
   const mainStart = Date.now();
   const doneStats = (bytes) => {
@@ -631,26 +808,37 @@ async function runDownload(targetUrl) {
     return { secs: +secs.toFixed(1), bps: Math.round(bytes / Math.max(secs, 0.01)) };
   };
   const url = info.finalUrl;
-  const baseName = opts.output || info.filename || path.basename(new URL(url).pathname) || 'download.bin';
+  const baseName = opts.output || info.filename || sanitizeUrlName(new URL(url).pathname.split('/').pop() || '') || 'download.bin';
   let outPath = baseName;
   if (opts.dir && !opts.output) {
     fs.mkdirSync(path.resolve(opts.dir), { recursive: true });
     outPath = path.join(path.resolve(opts.dir), path.basename(baseName));
   }
-  if (info.html) {
-    warn('Server returned a web page (text/html), not a file. Your link is probably expired or points at a preview/share page. Get a fresh direct link and retry.');
+  // Batch collisions: two URLs with the same server-chosen basename must not
+  // share an output (the second would read as "cached"). Reruns are unaffected:
+  // only paths claimed by THIS process are uniquified.
+  {
+    let resolved = path.resolve(outPath);
+    if (usedOutputs.has(resolved)) {
+      const ext = path.extname(outPath);
+      const stem = outPath.slice(0, outPath.length - ext.length);
+      let k = 1;
+      while (usedOutputs.has(path.resolve(`${stem} (${k})${ext}`))) k++;
+      outPath = `${stem} (${k})${ext}`;
+      resolved = path.resolve(outPath);
+    }
+    usedOutputs.add(resolved);
   }
-  const SOURCES = [url, ...(opts.mirror || [])];
-  await gateProxies(url);
-  const infoLine = `Size: ${fmtSize(info.size)} | Range: ${info.range ? 'yes' : 'no'} | Conn: ${CONNECTIONS} | Sources: ${SOURCES.length} | Proxies: ${PROXIES.length}${proxySource ? ` (${proxySource})` : ''}`;
-  say(infoLine);
-  emit({ event: 'start', url: displayUrl(url, true), output: outPath, size: info.size || 0, range: !!info.range, connections: CONNECTIONS, sources: SOURCES.length, proxies: PROXIES.length });
-  // fail fast before spending bandwidth
+  // fail fast before spending bandwidth (and before the proxy benchmark)
   const guardFail = (msg) => { emit({ event: 'error', scope: 'guard', message: msg }); throw new Error(msg); };
   const PROTECTED_NAMES = new Set(['proxies.txt', 'agent-dla.json', 'get-proxies.js', 'agent-dla.js', 'package.json', 'package-lock.json']);
+  for (const f of [proxySource, opts.config, opts.list]) {
+    if (f) PROTECTED_NAMES.add(path.basename(String(f)).toLowerCase());
+  }
   if (!opts.output && PROTECTED_NAMES.has(path.basename(outPath).toLowerCase())) {
     guardFail(`refusing: server filename "${path.basename(outPath)}" collides with a tool file (use -o to choose a name)`);
   }
+  if (info.html && !ALLOW_HTML) guardFail('server returned a web page (text/html), not a file — your link is probably expired or points at a preview/share page (use --allow-html to save it anyway)');
   if (EXPECT_SIZE && info.size && info.size !== EXPECT_SIZE) guardFail(`size mismatch: server says ${fmtSize(info.size)}, expected ${fmtSize(EXPECT_SIZE)}`);
   if (MAX_SIZE && info.size && info.size > MAX_SIZE) guardFail(`refusing: server size ${fmtSize(info.size)} exceeds --max-size ${fmtSize(MAX_SIZE)}`);
   if (EXPECT_TYPE && info.mime && info.mime !== EXPECT_TYPE) guardFail(`type mismatch: server says ${info.mime}, expected ${EXPECT_TYPE}`);
@@ -661,7 +849,8 @@ async function runDownload(targetUrl) {
       if (got.toLowerCase() !== EXPECT_SHA) {
         say('sha256 mismatch on existing file, redownloading...');
         try { fs.unlinkSync(outPath); } catch {}
-        try { fs.rmSync(outPath + '.parts', { recursive: true, force: true }); } catch {}
+        try { fs.unlinkSync(outPath + '.partial'); } catch {}
+        try { fs.unlinkSync(outPath + '.manifest.json'); } catch {}
       } else {
         emit({ event: 'done', output: path.resolve(outPath), bytes: info.size, seconds: 0, speed_bps: 0, sha256: got, cached: true });
         say(`Already complete -> ${path.resolve(outPath)}`);
@@ -674,9 +863,28 @@ async function runDownload(targetUrl) {
     }
   }
 
+  // Never silently overwrite/clobber with a server-chosen name. Explicit -o
+  // is user intent and keeps today's behavior (including single-stream resume).
+  // A .partial/.manifest proves a previous run of this tool: resume proceeds.
+  if (!opts.output && !opts.overwrite && fs.existsSync(outPath)
+    && !fs.existsSync(outPath + '.partial') && !fs.existsSync(outPath + '.manifest.json')) {
+    guardFail(`refusing to overwrite existing "${path.basename(outPath)}" with a server-chosen name (use -o or --overwrite)`);
+  }
+  const SOURCES = [url, ...(opts.mirror || [])];
+  await gateProxies(url);
+  const infoLine = `Size: ${fmtSize(info.size)} | Range: ${info.range ? 'yes' : 'no'} | Conn: ${CONNECTIONS} | Sources: ${SOURCES.length} | Proxies: ${PROXIES.length}${proxySource ? ` (${proxySource})` : ''}`;
+  say(infoLine);
+  if (PROXIES.length && !url.startsWith('https:')) {
+    warn('plain-http target through proxies: proxies see and can alter content — use --sha256 to be sure of what you got');
+  }
+  if (PROXIES.length && opts.insecure) {
+    warn('-k disables TLS verification, including through proxies (a proxy can intercept TLS) — use --sha256 to be sure of what you got');
+  }
+  emit({ event: 'start', url: displayUrl(url, true), output: outPath, size: info.size || 0, range: !!info.range, connections: CONNECTIONS, sources: SOURCES.length, proxies: PROXIES.length });
+
   if (!info.range || !info.size || CONNECTIONS === 1) {
     say(info.range ? 'Single connection fallback.' : 'Server ignores Range, single-stream download.');
-    shutdownHandler = (sig) => { console.error(`\nInterrupted (${sig}). Partial kept at ${outPath} — rerun to resume.`); process.exit(130); };
+    shutdownHandler = (sig) => { emit({ event: 'interrupted', signal: sig, output: outPath }); console.error(`\nInterrupted (${sig}). Partial kept at ${outPath} — rerun to resume.`); process.exit(sig === 'SIGTERM' ? 143 : 130); };
     let singleFails = 0;
     while (true) {
       try {
@@ -684,7 +892,7 @@ async function runDownload(targetUrl) {
         break;
       } catch (e) {
         const cls = classifyErr(e);
-        if (cls === 'fatal') { emit({ event: 'error', scope: 'single', message: e.message }); throw e; }
+        if (cls === 'fatal' || e.code === 'ENOTFOUND') { emit({ event: 'error', scope: 'single', message: e.message }); throw e; }
         singleFails++;
         if (singleFails > MAX_RETRIES) {
           emit({ event: 'error', scope: 'single', message: e.message });
@@ -696,7 +904,7 @@ async function runDownload(targetUrl) {
         await sleep(waitMs);
       }
     }
-    const v1 = await verifyOutput(outPath, null);
+    const v1 = await verifyOutput(outPath, null, info.size);
     shutdownHandler = null;
     const st1 = doneStats(v1.bytes);
     emit({ event: 'done', output: path.resolve(outPath), bytes: v1.bytes, seconds: st1.secs, speed_bps: st1.bps, sha256: v1.sha });
@@ -706,21 +914,86 @@ async function runDownload(targetUrl) {
 
   const size = info.size;
   const n = Math.min(CONNECTIONS, size);
-  const chunkSize = Math.floor(size / n);
-  const tmpDir = outPath + '.parts';
-  fs.mkdirSync(tmpDir, { recursive: true });
-  for (const f of fs.readdirSync(tmpDir)) { // leftovers from kills: .tmp is never valid input
-    if (f.endsWith('.tmp')) { try { fs.unlinkSync(path.join(tmpDir, f)); } catch {} }
+  const partialPath = outPath + '.partial';
+  const manifestPath = outPath + '.manifest.json';
+  const IF_RANGE = info.etag || info.mtime || null;
+  // Manifest resume: completed intervals (+ in-flight cursors, which are
+  // contiguous from their range start) survive kills; anything else is redone.
+  const mergeIv = (ivs) => {
+    const m = [];
+    for (const [a, b] of ivs.slice().sort((x, y) => x[0] - y[0])) {
+      const l = m[m.length - 1];
+      if (l && a <= l[1] + 1) l[1] = Math.max(l[1], b);
+      else m.push([a, b]);
+    }
+    return m;
+  };
+  let doneIv = [];
+  try {
+    const m = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    if (m && m.url === originalTarget && m.size === size
+      && (m.etag || null) === (info.etag || null) && (m.mtime || null) === (info.mtime || null)
+      && Array.isArray(m.done)) {
+      doneIv = mergeIv([...m.done, ...Object.values(m.active || {}).filter((a) => Array.isArray(a) && a[1] > a[0]).map(([s, c]) => [s, c - 1])]);
+      say(`Resuming from manifest (${doneIv.reduce((t, [s, e]) => t + (e - s + 1), 0)} of ${size} bytes kept).`);
+    } else {
+      try { fs.unlinkSync(partialPath); } catch {}
+      try { fs.unlinkSync(manifestPath); } catch {}
+    }
+  } catch {
+    try { fs.unlinkSync(partialPath); } catch {}
+    try { fs.unlinkSync(manifestPath); } catch {}
   }
-
+  const outFd = fs.openSync(partialPath, fs.existsSync(partialPath) ? 'r+' : 'w+');
+  try { fs.ftruncateSync(outFd, size); } catch {}
+  const snapshotActive = () => {
+    const o = {};
+    for (const [, rec] of inflight) o[rec.job.i] = [rec.job.start, rec.job.start + (active.get(rec.job.i) || 0)];
+    return o;
+  };
+  const writeManifest = (snap) => {
+    try {
+      fs.writeFileSync(manifestPath, JSON.stringify({
+        url: originalTarget, size, etag: info.etag || null, mtime: info.mtime || null,
+        done: doneIv, active: snap || snapshotActive(),
+      }));
+    } catch {}
+  };
+  const recordDone = (s, e) => {
+    if (e >= s) { doneIv.push([s, e]); doneIv = mergeIv(doneIv); }
+  };
+  const gapsOf = () => {
+    const gaps = [];
+    let cur = 0;
+    for (const [s, e] of doneIv) {
+      if (s > cur) gaps.push([cur, s - 1]);
+      cur = Math.max(cur, e + 1);
+    }
+    if (cur < size) gaps.push([cur, size - 1]);
+    return gaps;
+  };
   const jobs = [];
-  for (let i = 0; i < n; i++) {
-    const start = i * chunkSize;
-    const end = (i === n - 1) ? size - 1 : (i + 1) * chunkSize - 1;
-    jobs.push({ i, start, end, part: path.join(tmpDir, `part${i}`), src: SOURCES[i % SOURCES.length] });
+  {
+    const gaps = gapsOf();
+    const gapBytes = gaps.reduce((t, [s, e]) => t + (e - s + 1), 0);
+    const target = Math.max(1, Math.ceil(gapBytes / Math.max(n, 1)));
+    let cur = null;
+    const pushJob = (s, e) => jobs.push({ i: jobs.length, start: s, end: e, src: SOURCES[jobs.length % SOURCES.length] });
+    for (const [s, e] of gaps) {
+      let p = s;
+      while (p <= e) {
+        if (!cur) cur = { start: p, len: 0 };
+        const take = Math.min(target - cur.len, e - p + 1);
+        cur.len += take;
+        p += take;
+        if (cur.len >= target) { pushJob(cur.start, p - 1); cur = null; }
+      }
+    }
+    if (cur) pushJob(cur.start, cur.start + cur.len - 1);
   }
 
-  let doneBytes = 0; const t0 = Date.now();
+  let doneBytes = doneIv.reduce((t, [s, e]) => t + (e - s + 1), 0);
+  const t0 = Date.now();
   const active = new Map(); // job.i -> bytes downloaded in current attempt
   let pending = 0, totalRetries = 0, lastJsonEmit = 0;
   const liveBytes = () => {
@@ -744,7 +1017,7 @@ async function runDownload(targetUrl) {
       });
     }
   };
-  const timer = setInterval(draw, 250);
+  const timer = setInterval(() => { if (process.stdout.isTTY) draw(); else if (JSON_MODE) draw(); }, 250);
 
   // straggler mitigation: split a stalled chunk so faster workers take half
   const inflight = new Map(); // job.i -> { job, t0, token }
@@ -768,10 +1041,13 @@ async function runDownload(targetUrl) {
       if (Date.now() - (job.lastSplit || 0) < SPLIT_COOLDOWN_S * 1000) continue;
       const got = active.get(job.i) || 0;
       const speed = got / Math.max(age, 0.01);
-      const remain = job.end - job.start + 1;
+      const cursor = job.start + got; // bytes [start, cursor) are already on disk
+      const remain = job.end - cursor + 1;
       if (speed >= floor || remain < SPLIT_MIN_REMAIN) continue;
-      const mid = job.start + Math.floor((remain - 1) / 2);
-      const half = { i: jobs.length, start: mid + 1, end: job.end, part: path.join(tmpDir, `part${jobs.length}`), src: SOURCES[jobs.length % SOURCES.length], splits: 0 };
+      if (cursor > job.start) { recordDone(job.start, cursor - 1); writeManifest(); }
+      const mid = cursor + Math.floor((remain - 1) / 2);
+      const half = { i: jobs.length, start: mid + 1, end: job.end, src: SOURCES[jobs.length % SOURCES.length], splits: 0 };
+      job.start = cursor;
       job.end = mid;
       job.splits = (job.splits || 0) + 1;
       job.lastSplit = Date.now();
@@ -779,6 +1055,7 @@ async function runDownload(targetUrl) {
       queue.push(half);
       pending++;
       splitCount++;
+      active.set(job.i, 0);
       active.set(half.i, 0);
       try { if (token && token.req) { const e = new Error('split straggler'); e.code = 'SPLIT'; token.req.destroy(e); } } catch {}
       emit({ event: 'split', chunk: job.i, new_chunk: half.i, at: mid, speed_bps: Math.round(speed) });
@@ -786,43 +1063,110 @@ async function runDownload(targetUrl) {
     }
   }
   const splitTimer = setInterval(splitStragglers, 2000);
+  const manifestTimer = setInterval(() => writeManifest(), 1000); // hard kills keep ≤1s of progress
 
+  // Path-scoped failures: a 4xx (or any error) from a proxy or mirror evicts
+  // that path for the run; only the direct primary can fail the whole file.
+  const badMirrors = new Set();
+  const badProxies = new Set();
+  let primaryUrl = url;
+  let signedRefreshes = 0;
+  let refreshingSigned = null;
+  function pickSrc(job) {
+    if (job.src && !badMirrors.has(job.src)) return job.src;
+    for (const s of SOURCES) { if (!badMirrors.has(s) && s !== primaryUrl) return s; }
+    return primaryUrl;
+  }
+  function pickProxy() {
+    if (!PROXIES.length) return null;
+    for (let k = 0; k < PROXIES.length; k++) {
+      const p = nextProxy();
+      if (!badProxies.has(p)) return p;
+    }
+    return null; // everything evicted: go direct
+  }
+  function isDirectPath(src, proxy) { return !proxy && src === primaryUrl; }
+  async function refreshSignedUrl(job) {
+    // 401/403/410 from a redirected primary: the signed link likely expired.
+    if (signedRefreshes >= 5) return false;
+    if (refreshingSigned) { await refreshingSigned.catch(() => {}); return job.src === primaryUrl; }
+    refreshingSigned = (async () => {
+      signedRefreshes++;
+      const fresh = await getFileInfo(originalTarget);
+      if (fresh.size && fresh.size !== size) {
+        const e = new Error(`file changed mid-download (was ${fmtSize(size)}, now ${fmtSize(fresh.size)})`);
+        e.fatal = true; throw e;
+      }
+      const old = primaryUrl;
+      primaryUrl = fresh.finalUrl;
+      for (const j of jobs) { if (j.src === old) j.src = primaryUrl; }
+      emit({ event: 'signed-refresh', from: displayUrl(old, true), to: displayUrl(primaryUrl, true) });
+      say('Signed link expired, refreshed.');
+    })();
+    try { await refreshingSigned; }
+    catch (e) { refreshingSigned = null; throw e; }
+    refreshingSigned = null;
+    if (job.src !== primaryUrl) job.src = primaryUrl;
+    return true;
+  }
   // returns true on success, false to requeue, { fatal } to abort everything
   async function runJob(job) {
-    const ATTEMPTS = Math.min(Math.max(RETRIES + 1, PROXIES.length || 0), 16);
+    const ATTEMPTS = MAX_RETRIES === 0 ? 1 : Math.min(Math.max(RETRIES + 1, PROXIES.length || 0), 16);
     const track = (d) => active.set(job.i, (active.get(job.i) || 0) + d);
     const finishAttempt = (okBytes) => {
       inflight.delete(job.i);
       active.delete(job.i);
       if (okBytes) {
         doneBytes += okBytes;
+        recordDone(job.start, job.end);
+        writeManifest();
         emit({ event: 'chunk-done', chunk: job.i, bytes: okBytes, resumed: false, via: job.lastVia || 'direct' });
       }
     };
     for (let a = 0; a < ATTEMPTS; a++) {
-      const proxy = nextProxy();
+      if (a > 0) await sleep(300); // don't hammer back-to-back
+      checkDeadline();
+      const proxy = pickProxy();
+      const src = pickSrc(job);
+      job.src = src;
       const token = {};
       active.set(job.i, 0);
       inflight.set(job.i, { job, t0: Date.now(), token });
       try {
-        if (fs.existsSync(job.part)) {
-          const st = fs.statSync(job.part);
-          const expect = job.end - job.start + 1;
-          if (st.size === expect) { doneBytes += st.size; inflight.delete(job.i); active.delete(job.i); emit({ event: 'chunk-done', chunk: job.i, bytes: st.size, resumed: true }); return true; } // resume
-          fs.unlinkSync(job.part); // stale layout (different -n): redownload whole range
-        }
         job.lastVia = redactProxy(proxy);
-        await downloadChunkToFile(job.src, job.start, job.end, job.part + '.tmp', proxy, track, token);
-        fs.renameSync(job.part + '.tmp', job.part);
-        finishAttempt(job.end - job.start + 1);
+        const got = await downloadRange(src, job.start, job.end, outFd, proxy, track, token, 0, size, IF_RANGE, CUSTOM_HEADERS);
+        finishAttempt(got);
         return true;
       } catch (e) {
         inflight.delete(job.i);
         active.delete(job.i);
-        try { if (fs.existsSync(job.part + '.tmp')) fs.unlinkSync(job.part + '.tmp'); } catch {}
         const cls = classifyErr(e);
         if (cls === 'split') return 'split';
-        if (cls === 'fatal') return { fatal: e };
+        const direct = isDirectPath(src, proxy);
+        const status = e && e.status;
+        const path4xx = status >= 400 && status < 500 && status !== 408 && status !== 429;
+        if (!direct) {
+          if (proxy) badProxies.add(proxy);
+          if (src !== primaryUrl) badMirrors.add(src);
+          if ((status === 401 || status === 403 || status === 410) && src === primaryUrl && primaryUrl !== originalTarget) {
+            try {
+              if (await refreshSignedUrl(job)) continue;
+            } catch (re) { return { fatal: re }; }
+          }
+          if (path4xx || cls === 'fatal' || e.code === 'ENOTFOUND') continue; // next path, no backoff
+          if (cls === 'throttle' && e.retryAfter > 0) {
+            say(`Chunk ${job.i} throttled (HTTP ${e.status}), waiting ${e.retryAfter}s...`);
+            await sleep(Math.min(e.retryAfter, 120) * 1000);
+          }
+          continue;
+        }
+        if (e.code === 'ENOTFOUND') return { fatal: e };
+        if ((status === 401 || status === 403 || status === 410) && primaryUrl !== originalTarget) {
+          try {
+            if (await refreshSignedUrl(job)) return false; // requeue with the fresh link
+          } catch (re) { return { fatal: re }; }
+        }
+        if (cls === 'fatal' || path4xx) return { fatal: e };
         if (cls === 'throttle' && e.retryAfter > 0) {
           say(`Chunk ${job.i} throttled (HTTP ${e.status}), waiting ${e.retryAfter}s...`);
           await sleep(Math.min(e.retryAfter, 120) * 1000);
@@ -835,17 +1179,23 @@ async function runDownload(targetUrl) {
     inflight.set(job.i, { job, t0: Date.now(), token });
     try {
       job.lastVia = 'direct';
-      await downloadChunkToFile(job.src, job.start, job.end, job.part + '.tmp', null, track, token);
-      fs.renameSync(job.part + '.tmp', job.part);
-      finishAttempt(job.end - job.start + 1);
+      const got = await downloadRange(primaryUrl, job.start, job.end, outFd, null, track, token, 0, size, IF_RANGE, CUSTOM_HEADERS);
+      finishAttempt(got);
       return true;
     } catch (e) {
       inflight.delete(job.i);
       active.delete(job.i);
-      try { if (fs.existsSync(job.part + '.tmp')) fs.unlinkSync(job.part + '.tmp'); } catch {}
       const cls = classifyErr(e);
       if (cls === 'split') return 'split';
-      if (cls === 'fatal') return { fatal: e };
+      if (cls === 'fatal' || e.code === 'ENOTFOUND') {
+        const status = e && e.status;
+        if ((status === 401 || status === 403 || status === 410) && primaryUrl !== originalTarget) {
+          try {
+            if (await refreshSignedUrl(job)) return false;
+          } catch (re) { return { fatal: re }; }
+        }
+        return { fatal: e };
+      }
       return false;
     }
   }
@@ -862,11 +1212,14 @@ async function runDownload(targetUrl) {
     down = true;
     clearInterval(timer);
     clearInterval(splitTimer);
+    clearInterval(manifestTimer);
     for (const [, f] of inflight) { try { if (f.token && f.token.req) f.token.req.destroy(); } catch {} }
-    await sleep(500); // let in-flight catches unlink their .tmp
-    for (const j of jobs) { try { fs.unlinkSync(j.part + '.tmp'); } catch {} }
-    console.error(`\nInterrupted (${sig}). ${jobs.length - pending}/${jobs.length} chunks done, parts kept in ${tmpDir} — rerun the same command to resume.`);
-    process.exit(130);
+    await sleep(500); // let in-flight catches settle
+    writeManifest();
+    try { fs.closeSync(outFd); } catch {}
+    emit({ event: 'interrupted', signal: sig, chunks_done: jobs.length - pending, chunks_total: jobs.length, partial: partialPath });
+    console.error(`\nInterrupted (${sig}). ${jobs.length - pending}/${jobs.length} chunks done, progress kept in ${partialPath} + manifest — rerun the same command to resume.`);
+    process.exit(sig === 'SIGTERM' ? 143 : 130);
   };
   const workers = Array.from({ length: CONC }, async () => {
     while (true) {
@@ -877,15 +1230,16 @@ async function runDownload(targetUrl) {
       if (r === true) { pending--; continue; }
       if (r === 'split') { queue.push(j); continue; } // first half still pending, requeue it
       if (r && r.fatal) {
-        fatal = new Error(`chunk ${j.i} unrecoverable: ${r.fatal.message} (parts kept in ${tmpDir}, rerun resumes what completed)`);
+        fatal = new Error(`chunk ${j.i} unrecoverable: ${r.fatal.message} (progress kept in ${partialPath} + manifest, rerun resumes what completed)`);
         pending = 0;
         return;
       }
       j.fails = (j.fails || 0) + 1;
       totalRetries++;
+      checkDeadline();
       emit({ event: 'retry', scope: 'chunk', chunk: j.i, fails: j.fails, after_ms: Math.round(backoffMs(j.fails)) });
       if (j.fails > MAX_RETRIES) {
-        fatal = new Error(`chunk ${j.i} failed ${MAX_RETRIES}x (parts kept in ${tmpDir}, rerun to resume)`);
+        fatal = new Error(`chunk ${j.i} failed ${MAX_RETRIES}x (progress kept in ${partialPath} + manifest, rerun to resume)`);
         pending = 0;
         return;
       }
@@ -895,32 +1249,24 @@ async function runDownload(targetUrl) {
     }
   });
   await Promise.all(workers);
-  if (fatal) { clearInterval(timer); clearInterval(splitTimer); throw fatal; }
   clearInterval(timer);
   clearInterval(splitTimer);
+  clearInterval(manifestTimer);
+  if (fatal) { try { fs.closeSync(outFd); } catch {} throw fatal; }
   if (JSON_MODE) {
     const elFin = (Date.now() - t0) / 1000;
     emit({
       event: 'progress', bytes_done: size, total: size,
       speed_bps: Math.round(size / Math.max(elFin, 0.01)), eta_s: 0,
-      chunks_done: jobs.length, chunks_total: jobs.length, active: 0, retries: totalRetries,
+      chunks_done: jobs.length, chunks_total: jobs.length, active: 0, retries: totalRetries, splits: splitCount,
     });
   }
-  say('Merging...');
-
-  const ws = fs.createWriteStream(outPath);
-  for (const j of [...jobs].sort((a, b) => a.start - b.start)) {
-    await new Promise((res, rej) => {
-      const rs = fs.createReadStream(j.part);
-      rs.pipe(ws, { end: false });
-      rs.on('end', res); rs.on('error', rej);
-    });
-  }
-  ws.end();
-  await new Promise(r => ws.on('finish', r));
-  const v = await verifyOutput(outPath, tmpDir);
+  say('Verifying...');
+  const v = await verifyOutput(partialPath, manifestPath, size);
+  fs.renameSync(partialPath, outPath);
+  try { fs.unlinkSync(manifestPath); } catch {}
   shutdownHandler = null;
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+  try { fs.closeSync(outFd); } catch {}
   const el = (Date.now() - t0) / 1000;
   emit({ event: 'done', output: path.resolve(outPath), bytes: size, seconds: +el.toFixed(1), speed_bps: Math.round(size / Math.max(el, 0.1)), sha256: v.sha });
   say(`Saved -> ${path.resolve(outPath)} (${(size / 1048576).toFixed(2)} MB in ${el.toFixed(1)}s, ${(size / 1024 / 1024 / Math.max(el, 0.1)).toFixed(2)} MB/s)`);
@@ -938,11 +1284,12 @@ async function runDownload(targetUrl) {
     if ((opts.mirror || []).length) { console.error('--mirror with multiple URLs is unsafe (mirrors must serve the same file)'); process.exit(2); }
     if (opts.sha256 || opts.expectSize) { console.error('--sha256/--expect-size need a single download'); process.exit(2); }
   }
-  emit({ event: 'batch', files: targets.length });
+  emit({ event: 'batch', files: targets.length, schema: 1 });
   const bt0 = Date.now();
   let bytes = 0;
   const failed = [];
   for (const t of targets) {
+    DL_AT = DEADLINE_MS > 0 ? Date.now() + DEADLINE_MS : 0;
     if (!validTarget(t)) {
       const msg = 'skipping invalid URL (want http(s))';
       failed.push(displayUrl(t, true));
@@ -959,6 +1306,6 @@ async function runDownload(targetUrl) {
     shutdownHandler = null;
   }
   const bsecs = (Date.now() - bt0) / 1000;
-  emit({ event: 'batch-done', files: targets.length, completed: targets.length - failed.length, failed, bytes, seconds: +bsecs.toFixed(1) });
+  emit({ event: 'batch-done', files: targets.length, completed: targets.length - failed.length, failed, bytes, seconds: +bsecs.toFixed(1), schema: 1 });
   if (failed.length) { console.error(`${failed.length}/${targets.length} failed`); process.exit(1); }
 })().catch(e => { emit({ event: 'error', message: e.message }); console.error(e.message); process.exit(1); });

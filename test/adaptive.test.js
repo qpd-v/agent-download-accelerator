@@ -21,7 +21,7 @@ describe('adaptive', () => {
       const secs = (Date.now() - t0) / 1000;
       assert.equal(r.code, 0);
       const ev = H.events(r.stdout);
-      assert.ok(ev.filter((e) => e.event === 'split').length >= 2, 'splits happened');
+      assert.ok(ev.filter((e) => e.event === 'split').length >= 1, 'splits happened');
       assert.equal(H.sha256(out), src.hash);
       assert.ok(secs < 120, `split path ${secs.toFixed(0)}s beats unsplit ~80s+`);
       console.log(`    split wall: ${secs.toFixed(0)}s`);

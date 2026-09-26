@@ -6,28 +6,6 @@ const http = require('http');
 const H = require('./helpers');
 
 // Minimal HTTP forward proxy (absolute-form requests, http only) for tests.
-function startForwardProxy() {
-  const server = http.createServer((clientReq, clientRes) => {
-    let target;
-    try { target = new URL(clientReq.url); } catch { clientRes.writeHead(400); clientRes.end(); return; }
-    if (target.protocol !== 'http:') { clientRes.writeHead(502); clientRes.end(); return; }
-    const headers = { ...clientReq.headers };
-    delete headers['proxy-authorization'];
-    delete headers['proxy-connection'];
-    headers.host = target.host;
-    const preq = http.request(
-      { host: target.hostname, port: target.port || 80, path: target.pathname + target.search, method: clientReq.method, headers },
-      (pres) => { clientRes.writeHead(pres.statusCode, pres.headers); pres.pipe(clientRes); },
-    );
-    preq.on('error', () => { try { clientRes.writeHead(502); clientRes.end(); } catch {} });
-    clientReq.pipe(preq);
-  });
-  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({
-    server,
-    port: server.address().port,
-    close: () => new Promise((r) => server.close(r)),
-  })));
-}
 
 describe('security', () => {
   it('--help exits 0 without touching the network', { timeout: 60000 }, async () => {
@@ -111,7 +89,7 @@ describe('security', () => {
     const work = H.workdir('sec-redact');
     const src = H.makeFile(work, 'src.bin', 1 * 1024 * 1024, 7);
     const srv = await H.startServer({ '/f.bin': { buf: fs.readFileSync(src.path), tmp: path.join(work, 'srv.tmp') } });
-    const proxy = await startForwardProxy();
+    const proxy = await H.startForwardProxy();
     try {
       fs.writeFileSync(path.join(work, 'proxies.txt'), `http://user:s3cret@127.0.0.1:${proxy.port}\n`);
       const backstop = path.join(work, 'backstop.js');
@@ -136,6 +114,62 @@ describe('security', () => {
     } finally {
       await srv.close();
       await proxy.close();
+    }
+  });
+
+  it('existing file is not clobbered by a server-chosen name', { timeout: 60000 }, async () => {
+    const work = H.workdir('sec-noclobber');
+    fs.writeFileSync(path.join(work, 'notes.txt'), 'MY IMPORTANT NOTES\n');
+    const body = Buffer.from('ATTACKER CONTENT\n');
+    const s = http.createServer((q, res) => {
+      res.writeHead(200, { 'Content-Length': body.length, 'Content-Disposition': 'attachment; filename="notes.txt"' });
+      res.end(body);
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/dl`, '--json'], { cwd: work });
+      assert.equal(r.code, 1);
+      assert.equal(fs.readFileSync(path.join(work, 'notes.txt'), 'utf8'), 'MY IMPORTANT NOTES\n');
+    } finally {
+      s.close();
+    }
+  });
+
+  it('trailing-dot alias of a protected name is refused', { timeout: 60000 }, async () => {
+    const work = H.workdir('sec-dotfile');
+    fs.writeFileSync(path.join(work, 'proxies.txt'), '# my proxies\n');
+    const body = Buffer.from('ATTACKER CONTENT\n');
+    const s = http.createServer((q, res) => {
+      res.writeHead(200, { 'Content-Length': body.length, 'Content-Disposition': 'attachment; filename="proxies.txt."' });
+      res.end(body);
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/dl`, '--json', '--no-auto-refresh'], { cwd: work });
+      assert.equal(r.code, 1);
+      assert.equal(fs.readFileSync(path.join(work, 'proxies.txt'), 'utf8'), '# my proxies\n');
+    } finally {
+      s.close();
+    }
+  });
+
+  it('redirect to a dotfile does not write a hidden file', { timeout: 60000 }, async () => {
+    const work = H.workdir('sec-redirect-name');
+    const body = Buffer.from('hello\n');
+    const s = http.createServer((q, res) => {
+      if (q.url === '/start') { res.writeHead(302, { Location: '/x/.bashrc' }); res.end(); return; }
+      res.writeHead(200, { 'Content-Length': body.length });
+      res.end(body);
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/start`, '--json'], { cwd: work });
+      assert.equal(r.code, 0);
+      const files = fs.readdirSync(work);
+      assert.ok(!files.includes('.bashrc'), 'no hidden file written');
+      assert.ok(files.includes('bashrc'), 'de-dotted name used');
+    } finally {
+      s.close();
     }
   });
 });

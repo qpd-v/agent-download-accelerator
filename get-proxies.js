@@ -93,7 +93,7 @@ async function main() {
       if (tested % 50 === 0) process.stdout.write(`\r${tested}/${cands.length} tested, ${winners.length} working  `);
       if (basic && basic.status === 200) {
         const rg = await via(px, 'http://httpbin.org/range/4096', { Range: 'bytes=0-99' });
-        if (rg && (rg.status === 206 || rg.status === 200)) winners.push({ px, ms: basic.ms });
+        if (rg && rg.status === 206) winners.push({ px, ms: basic.ms });
       }
     }
   }));

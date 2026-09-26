@@ -16,9 +16,8 @@ function workdir(name) {
   return dir;
 }
 
-function makeFile(dir, name, size, mult = 7) {
-  const buf = Buffer.allocUnsafe(size);
-  for (let i = 0; i < size; i++) buf[i] = (i * mult) & 0xff;
+function makeFile(dir, name, size) {
+  const buf = crypto.randomBytes(size);
   fs.writeFileSync(path.join(dir, name), buf);
   return { path: path.join(dir, name), hash: crypto.createHash('sha256').update(buf).digest('hex'), size };
 }
@@ -64,10 +63,10 @@ function startServer(files, hooks) {
     res.writeHead(m ? 206 : 200, h);
     const fd = fds[u.pathname];
     (async () => {
-      const b = Buffer.allocUnsafe(16384);
       for (let off = start; off <= end; off += 16384) {
         if (res.destroyed) return;
         const len = Math.min(16384, end - off + 1);
+        const b = Buffer.allocUnsafe(16384);
         fs.readSync(fd, b, 0, len, off);
         res.write(b.subarray(0, len));
         if (slowBps) await sleep((len / slowBps) * 1000);
@@ -100,8 +99,33 @@ function runAccel(args, { cwd, env, timeoutMs = 120000 } = {}) {
   });
 }
 
+// Minimal HTTP forward proxy for absolute-form requests (http only).
+function startForwardProxy(handler) {
+  const server = http.createServer((clientReq, clientRes) => {
+    if (handler) return handler(clientReq, clientRes);
+    let target;
+    try { target = new URL(clientReq.url); } catch { clientRes.writeHead(400); clientRes.end(); return; }
+    if (target.protocol !== 'http:') { clientRes.writeHead(502); clientRes.end(); return; }
+    const headers = { ...clientReq.headers };
+    delete headers['proxy-authorization'];
+    delete headers['proxy-connection'];
+    headers.host = target.host;
+    const preq = http.request(
+      { host: target.hostname, port: target.port || 80, path: target.pathname + target.search, method: clientReq.method, headers },
+      (pres) => { clientRes.writeHead(pres.statusCode, pres.headers); pres.pipe(clientRes); },
+    );
+    preq.on('error', () => { try { clientRes.writeHead(502); clientRes.end(); } catch {} });
+    clientReq.pipe(preq);
+  });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({
+    server,
+    port: server.address().port,
+    close: () => new Promise((r) => server.close(r)),
+  })));
+}
+
 function events(stdout) {
   return stdout.split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
 }
 
-module.exports = { AGENT_DLA, workdir, makeFile, sha256, sleep, startServer, runAccel, events };
+module.exports = { AGENT_DLA, workdir, makeFile, sha256, sleep, startServer, runAccel, events, startForwardProxy };

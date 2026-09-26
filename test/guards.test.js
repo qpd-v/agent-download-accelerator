@@ -30,7 +30,7 @@ describe('guards', () => {
       const out = path.join(work, 'out.bin');
       const r = await H.runAccel([srv.url('/f.bin'), '-o', out, '-n', '4', '--json', '--sha256', BADHASH], { cwd: work });
       assert.equal(r.code, 1);
-      assert.ok(!fs.existsSync(out) && !fs.existsSync(out + '.parts'));
+      assert.ok(!fs.existsSync(out) && !fs.existsSync(out + '.partial'));
       assert.ok(H.events(r.stdout).some((e) => e.event === 'error' && e.scope === 'verify'));
     } finally {
       await srv.close();
@@ -55,6 +55,25 @@ describe('guards', () => {
       assert.equal(r.code, 2);
     } finally {
       await srv.close();
+    }
+  });
+
+  it('html responses are refused, not saved', { timeout: 60000 }, async () => {
+    const work = H.workdir('guards-html');
+    const s = require('http').createServer((q, res) => {
+      const html = '<html><body>login required</body></html>';
+      res.writeHead(200, { 'Content-Type': 'text/html', 'Content-Length': Buffer.byteLength(html) });
+      res.end(html);
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'file.zip');
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/file.zip`, '-o', out, '--json'], { cwd: work });
+      assert.equal(r.code, 1);
+      assert.match(r.stdout + r.stderr, /text\/html/);
+      assert.ok(!fs.existsSync(out));
+    } finally {
+      s.close();
     }
   });
 
