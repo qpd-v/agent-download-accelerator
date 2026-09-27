@@ -98,7 +98,7 @@ strings, and fragments; `--redact` extends that to human logs.
   into one directory are safe; a corrupt receipt affects only its own file.
   Resume identity keeps the URL query string, except signature/expiry
   parameters (`X-Amz-*`, `X-Goog-*`, `Signature`, `Expires`, `Key-Pair-Id`,
-  `Policy`, `sig`, `se`, `sp`, `sv`, `st`, `sr`, `token`) which are dropped —
+  `Policy`, `sig`, `se`, `sp`, `sv`, `st`, `sr`) which are dropped (`token` is kept: it often selects the file) —
   so `?id=1` vs `?id=2` never share a manifest (even with identical ETags),
   while a refreshed presigned URL resumes the same file with or without an
   ETag.

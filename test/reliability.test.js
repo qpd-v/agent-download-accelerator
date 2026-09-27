@@ -1171,6 +1171,78 @@ describe('reliability', () => {
     }
   });
 
+  it('download tokens never share an identity (tokencollide)', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-tokencollide');
+    const bA = crypto.randomBytes(2 * MB);
+    const bB = crypto.randomBytes(2 * MB);
+    const hA = crypto.createHash('sha256').update(bA).digest('hex');
+    const hB = crypto.createHash('sha256').update(bB).digest('hex');
+    // ?token= selects the file (download-token endpoints). It must stay in
+    // the key: stripping it merges A and B into wrong-bytes-exit-0 (T1).
+    const s = require('http').createServer((q, res) => {
+      const u = new URL(q.url, 'http://x');
+      const cur = u.searchParams.get('token') === 'B' ? bB : bA;
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : cur.length - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${cur.length}` } : {}) });
+      res.end(cur.subarray(a, b + 1));
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const base = `http://127.0.0.1:${s.address().port}/download?token=`;
+      const r1 = await H.runAccel([`${base}A`, '-o', path.join(work, 'model.bin'), '--json'], { cwd: work });
+      assert.equal(r1.code, 0);
+      assert.equal(H.sha256(path.join(work, 'model.bin')), hA);
+      // Same -o, different token: no valid receipt, so a clean re-download of B.
+      const r2 = await H.runAccel([`${base}B`, '-o', path.join(work, 'model.bin'), '--json'], { cwd: work });
+      assert.equal(r2.code, 0);
+      assert.equal(H.sha256(path.join(work, 'model.bin')), hB, 'output is exactly B, never cached A');
+    } finally {
+      s.close();
+    }
+  });
+
+  it('download tokens never share a manifest (tokenresume)', { timeout: 180000 }, async () => {
+    const work = H.workdir('rel-tokenresume');
+    const bA = crypto.randomBytes(8 * MB);
+    const bB = crypto.randomBytes(8 * MB);
+    const hB = crypto.createHash('sha256').update(bB).digest('hex');
+    const s = require('http').createServer((q, res) => {
+      const u = new URL(q.url, 'http://x');
+      const cur = u.searchParams.get('token') === 'B' ? bB : bA;
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : cur.length - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${cur.length}` } : {}) });
+      let off = a;
+      const tick = () => {
+        if (res.destroyed) return;
+        const n = Math.min(64 * 1024, b - off + 1);
+        res.write(cur.subarray(off, off + n));
+        off += n;
+        if (off > b) res.end();
+        else setTimeout(tick, 250); // ~256KB/s per chunk: the kill always lands mid-flight
+      };
+      tick();
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const base = `http://127.0.0.1:${s.address().port}/download?token=`;
+      const out = path.join(work, 'model.bin');
+      const c = spawn('node', [H.AGENT_DLA, `${base}A`, '-o', out, '-n', '4'], { cwd: work });
+      const closed = new Promise((r) => c.on('close', r));
+      await H.sleep(2500);
+      c.kill();
+      await closed;
+      assert.ok(fs.existsSync(out + '.partial'), 'partial kept after kill');
+      // token=B must not reuse token=A's manifest: output must be exactly B.
+      const r = await H.runAccel([`${base}B`, '-o', out, '-n', '4', '--json'], { cwd: work });
+      assert.equal(r.code, 0);
+      assert.equal(H.sha256(out), hB, 'output is exactly B, no mixed blocks');
+    } finally {
+      s.close();
+    }
+  });
+
   it('refreshed presigned link without an ETag still resumes', { timeout: 120000 }, async () => {
     const work = H.workdir('rel-presignresume');
     const buf = crypto.randomBytes(2 * MB);

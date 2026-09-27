@@ -273,7 +273,11 @@ function sanitizeUrlName(raw) {
 // different query is a different resource (Q1).
 const SIG_QUERY_PARAMS = new Set([
   'signature', 'expires', 'key-pair-id', 'policy',
-  'sig', 'se', 'sp', 'sv', 'st', 'sr', 'token',
+  'sig', 'se', 'sp', 'sv', 'st', 'sr',
+  // NOTE: 'token' is deliberately NOT stripped: ?token= commonly selects the
+  // file (download-token endpoints), so stripping it merges identities and
+  // yields wrong bytes with exit 0 (T1). Supabase/Firebase refreshed links
+  // therefore restart instead of resume — safe (correct bytes), just slower.
 ]);
 function stripSigQuery(search) {
   if (!search || search === '?') return '';
