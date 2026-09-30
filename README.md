@@ -100,6 +100,10 @@ strings, and fragments; `--redact` extends that to human logs.
   (`.agent-dla/receipts/<name>.json`, one file per output, atomic writes);
   reruns trust size+receipt (or `--sha256`), never size alone. Parallel runs
   into one directory are safe; a corrupt receipt affects only its own file.
+  Two runs into the *same* output are refused: the second exits 1 while
+  `<out>.partial.lock` (holding the owner's pid) exists. A lock left by a
+  killed run is taken over automatically; if a reused pid keeps a stale lock
+  alive, the error names the file to delete.
   Resume identity keeps the URL query string, except signature/expiry
   parameters (`X-Amz-*`, `X-Goog-*`, `Signature`, `Expires`, `Key-Pair-Id`,
   `Policy`, `sig`, `se`, `sp`, `sv`, `st`, `sr`) which are dropped (`token` is kept: it often selects the file) —

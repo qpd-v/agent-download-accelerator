@@ -1464,6 +1464,51 @@ describe('reliability', () => {
     }
   });
 
+  it('a second run into the same output refuses; stale locks are taken over (N2)', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-output-lock');
+    const buf = crypto.randomBytes(4 * MB);
+    const hash = crypto.createHash('sha256').update(buf).digest('hex');
+    const s = require('http').createServer((q, res) => {
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : buf.length - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${buf.length}` } : {}) });
+      let off = a;
+      const tick = () => {
+        if (res.destroyed) return;
+        const n = Math.min(64 * 1024, b - off + 1);
+        res.write(buf.subarray(off, off + n));
+        off += n;
+        if (off > b) res.end(); else setTimeout(tick, 100);
+      };
+      tick();
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const url = `http://127.0.0.1:${s.address().port}/f.bin`;
+      const out = path.join(work, 'o.bin');
+      const first = spawn('node', [H.AGENT_DLA, url, '-o', out, '-n', '1'], { cwd: work });
+      const firstDone = new Promise((r) => first.on('close', r));
+      await H.sleep(1500);
+      assert.ok(fs.existsSync(out + '.partial.lock'), 'lock held while downloading');
+      const r2 = await H.runAccel([url, '-o', out, '-n', '1', '--json'], { cwd: work });
+      assert.equal(r2.code, 1, 'second run must refuse, not share the .partial');
+      assert.match(r2.stdout + r2.stderr, /already writing/);
+      assert.equal(await firstDone, 0);
+      assert.equal(H.sha256(out), hash, 'first run finished with exact bytes');
+      assert.ok(!fs.existsSync(out + '.partial.lock'), 'lock released on completion');
+      // A lock left by a killed process (dead pid) is stale: taken over.
+      fs.rmSync(out);
+      fs.rmSync(path.join(work, '.agent-dla'), { recursive: true, force: true });
+      fs.writeFileSync(out + '.partial.lock', '2147483000'); // no such pid
+      const r3 = await H.runAccel([url, '-o', out, '-n', '1', '--json'], { cwd: work });
+      assert.equal(r3.code, 0, r3.stderr.slice(-300));
+      assert.equal(H.sha256(out), hash);
+      assert.ok(!fs.existsSync(out + '.partial.lock'), 'stale lock replaced then released');
+    } finally {
+      s.close();
+    }
+  });
+
   it('single-stream revoked link aborts fast with progress kept (R2)', { timeout: 120000 }, async () => {
     const work = H.workdir('rel-single-revoked');
     const buf = crypto.randomBytes(4 * MB);

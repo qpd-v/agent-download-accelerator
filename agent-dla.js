@@ -145,6 +145,39 @@ const MAX_SIZE = parseSize(opts.maxSize);
 const EXPECT_TYPE = (opts.expectType || '').trim() || null;
 const ALLOW_HTML = !!opts.allowHtml;
 const usedOutputs = new Set(); // outputs claimed by this process (batch uniqueness)
+// Exclusive per-output lock (N2): two processes writing one output would share
+// its .partial/manifest. `<out>.partial.lock` holds the owner's pid, created
+// with O_EXCL. A lock whose pid is gone is stale (crash/kill) and is taken over.
+// A reused pid looks alive: the error names the lock file so a human can clear it.
+const heldLocks = new Set();
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return !!(e && e.code === 'EPERM'); }
+}
+function acquireOutputLock(outPath) {
+  const lockPath = path.resolve(outPath) + '.partial.lock';
+  if (heldLocks.has(lockPath)) return null; // same process re-entering (fresh/stale restart)
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const fd = fs.openSync(lockPath, 'wx');
+      try { fs.writeSync(fd, String(process.pid)); } finally { fs.closeSync(fd); }
+      heldLocks.add(lockPath);
+      return () => { heldLocks.delete(lockPath); try { fs.unlinkSync(lockPath); } catch {} };
+    } catch (e) {
+      if (e.code !== 'EEXIST') return null; // can't lock (read-only dir etc.): don't block the download
+      let pid = NaN;
+      try { pid = parseInt(fs.readFileSync(lockPath, 'utf8'), 10); } catch (re) { if (re.code === 'ENOENT') continue; }
+      if (pidAlive(pid) && pid !== process.pid) {
+        const err = new Error(`another agent-dla (pid ${pid}) is already writing "${path.basename(outPath)}" (if not, delete ${lockPath})`);
+        err.fatal = true;
+        throw err;
+      }
+      try { fs.unlinkSync(lockPath); } catch {} // stale: owner is gone
+    }
+  }
+  return null;
+}
+process.on('exit', () => { for (const l of heldLocks) { try { fs.unlinkSync(l); } catch {} } });
 const CUSTOM_HEADERS = {};
 for (const h of (opts.header || [])) {
   const i = String(h).indexOf(':');
@@ -1026,6 +1059,12 @@ function isDefinitiveProbeErr(e) {
 const MAX_REFRESHES_WITHOUT_PROGRESS = 5;
 
 async function runDownload(targetUrl, retryOpts = {}) {
+  if (retryOpts.lockBox) return runDownloadInner(targetUrl, retryOpts);
+  const lockBox = { release: null };
+  try { return await runDownloadInner(targetUrl, { ...retryOpts, lockBox }); }
+  finally { if (lockBox.release) lockBox.release(); }
+}
+async function runDownloadInner(targetUrl, retryOpts = {}) {
   const originalTarget = targetUrl;
   const staleDepth = retryOpts.staleDepth || 0;
   const forceSingle = !!retryOpts.forceSingle;
@@ -1133,6 +1172,10 @@ async function runDownload(targetUrl, retryOpts = {}) {
   };
   // fail fast before spending bandwidth (and before the proxy benchmark)
   const guardFail = (msg) => { emit({ event: 'error', scope: 'guard', message: msg }); throw new Error(msg); };
+  try {
+    const rel = acquireOutputLock(outPath);
+    if (rel && retryOpts.lockBox) retryOpts.lockBox.release = rel;
+  } catch (e) { guardFail(e.message); }
   const PROTECTED_NAMES = new Set(['proxies.txt', 'agent-dla.json', 'get-proxies.js', 'agent-dla.js', 'package.json', 'package-lock.json']);
   for (const f of [proxySource, opts.config, opts.list]) {
     if (f) PROTECTED_NAMES.add(path.basename(String(f)).toLowerCase());
@@ -1292,7 +1335,7 @@ async function runDownload(targetUrl, retryOpts = {}) {
               // Republished mid-download: kept bytes are the old version.
               try { fs.unlinkSync(singlePartial); } catch {}
               try { fs.unlinkSync(singleSidecar); } catch {}
-              if (staleDepth < 2) return runDownload(targetUrl, { forceSingle, staleDepth: staleDepth + 1, isRetry: true });
+              if (staleDepth < 2) return runDownload(targetUrl, { forceSingle, staleDepth: staleDepth + 1, isRetry: true, lockBox: retryOpts.lockBox });
               emit({ event: 'error', scope: 'single', message: re.message });
               throw re;
             }
@@ -1799,16 +1842,16 @@ async function runDownload(targetUrl, retryOpts = {}) {
     // does not.
     try { fs.unlinkSync(partialPath); } catch {}
     try { fs.unlinkSync(manifestPath); } catch {}
-    if (staleDepth < 1) return runDownload(targetUrl, { staleDepth: staleDepth + 1, isRetry: true });
+    if (staleDepth < 1) return runDownload(targetUrl, { staleDepth: staleDepth + 1, isRetry: true, lockBox: retryOpts.lockBox });
     say('Validators kept changing, falling back to single-stream.');
-    return runDownload(targetUrl, { forceSingle: true, staleDepth: staleDepth + 1, isRetry: true });
+    return runDownload(targetUrl, { forceSingle: true, staleDepth: staleDepth + 1, isRetry: true, lockBox: retryOpts.lockBox });
   }
   if (staleRestart) {
     // The server stopped honoring Range mid-run: wipe the chunked state and
     // redo this file as a single stream (which tolerates 200s).
     try { fs.unlinkSync(partialPath); } catch {}
     try { fs.unlinkSync(manifestPath); } catch {}
-    if (staleDepth < 2) return runDownload(targetUrl, { forceSingle: true, staleDepth: staleDepth + 1, isRetry: true });
+    if (staleDepth < 2) return runDownload(targetUrl, { forceSingle: true, staleDepth: staleDepth + 1, isRetry: true, lockBox: retryOpts.lockBox });
     throw new Error('server repeatedly ignored Range requests');
   }
   if (JSON_MODE) {
