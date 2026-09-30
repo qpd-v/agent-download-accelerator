@@ -1311,6 +1311,154 @@ describe('reliability', () => {
     }
   });
 
+  // Signed-link server for the R1/R2 tests: /release 302s to a link that
+  // lives `lifeMs`; data responses are paced and cut once at each time/offset
+  // `cutAt` returns true for (a flaky network), so retries hit expired links.
+  function signedLinkServer(buf, { lifeMs, pace, cutAt, release }) {
+    const st = { refreshes: 0, served: 0, releases: 0, t0: Date.now() };
+    const cut = new Set();
+    const s = require('http').createServer((q, res) => {
+      const u = new URL(q.url, 'http://x');
+      if (u.pathname === '/release') {
+        st.releases++;
+        const r = release ? release(st.releases) : null;
+        if (r) { res.writeHead(r); res.end('no'); return; }
+        res.writeHead(302, { Location: `/signed?exp=${Date.now() + lifeMs}` });
+        res.end();
+        return;
+      }
+      if (Date.now() > +u.searchParams.get('exp')) { res.writeHead(403); res.end('expired'); return; }
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : buf.length - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${buf.length}` } : {}) });
+      let off = a;
+      const tick = () => {
+        if (res.destroyed) return;
+        const key = cutAt && cutAt(off, Date.now() - st.t0);
+        if (key !== null && key !== undefined && key !== false && !cut.has(key)) { cut.add(key); q.socket.destroy(); return; }
+        const n = Math.min(pace.bytes, b - off + 1);
+        res.write(buf.subarray(off, off + n));
+        st.served += n;
+        off += n;
+        if (off > b) res.end();
+        else setTimeout(tick, pace.ms);
+      };
+      tick();
+    });
+    return { s, st };
+  }
+  const refreshEvents = (r) => r.stdout.split('\n').filter((l) => l.includes('"signed-refresh"')).length;
+
+  it('long download over short-lived links refreshes more than 5 times (R1)', { timeout: 180000 }, async () => {
+    const work = H.workdir('rel-refresh-many');
+    const buf = crypto.randomBytes(6 * MB);
+    const hash = crypto.createHash('sha256').update(buf).digest('hex');
+    // -n 6 = six 1MB jobs at ~64KB/s. Job k's connection drops once at
+    // 1.5s + 2.5s*k; its retry finds the 1s link expired and must refresh. Six
+    // spaced drops = six successful refreshes, each followed by progress.
+    const { s } = signedLinkServer(buf, {
+      lifeMs: 1000,
+      pace: { bytes: 16 * 1024, ms: 250 },
+      cutAt: (off, el) => { const k = Math.floor(off / MB); return el > 1500 + 2500 * k ? k : null; },
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'o.bin');
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/release`, '-o', out, '-n', '6', '--json'], { cwd: work, timeoutMs: 170000 });
+      assert.equal(r.code, 0, r.stderr.slice(-400));
+      assert.equal(H.sha256(out), hash);
+      assert.ok(refreshEvents(r) >= 6, `expected >= 6 successful refreshes, got ${refreshEvents(r)}`);
+    } finally {
+      s.close();
+    }
+  });
+
+  it('refreshes that deliver nothing still hit the cap (R1 bound)', { timeout: 180000 }, async () => {
+    const work = H.workdir('rel-refresh-dead');
+    const buf = crypto.randomBytes(4 * MB);
+    // First link works for 1s; every refreshed link is single-use: it
+    // answers the refresh probe, then refuses the data request. Refreshes
+    // "succeed" but never deliver a byte: must abort, not loop.
+    let links = 0;
+    const uses = new Map();
+    const s = require('http').createServer((q, res) => {
+      const u = new URL(q.url, 'http://x');
+      if (u.pathname === '/release') {
+        links++;
+        res.writeHead(302, { Location: `/signed?id=${links}&exp=${Date.now() + 1000}` });
+        res.end();
+        return;
+      }
+      const id = +u.searchParams.get('id');
+      uses.set(id, (uses.get(id) || 0) + 1);
+      if (Date.now() > +u.searchParams.get('exp') || (id > 1 && uses.get(id) > 1)) { res.writeHead(403); res.end('expired'); return; }
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : buf.length - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${buf.length}` } : {}) });
+      if (b - a < 64 * 1024) { res.end(buf.subarray(a, b + 1)); return; } // probe
+      res.write(buf.subarray(a, a + 64 * 1024));
+      setTimeout(() => { try { q.socket.destroy(); } catch {} }, 1500);
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'o.bin');
+      const t0 = Date.now();
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/release`, '-o', out, '-n', '2', '--json'], { cwd: work, timeoutMs: 170000 });
+      assert.equal(r.code, 1);
+      assert.match(r.stdout + r.stderr, /refresh failed repeatedly/);
+      assert.ok(Date.now() - t0 < 120000, 'bounded');
+    } finally {
+      s.close();
+    }
+  });
+
+  it('single-stream refreshes an expired signed link and resumes (R2)', { timeout: 180000 }, async () => {
+    const work = H.workdir('rel-single-refresh');
+    const buf = crypto.randomBytes(4 * MB);
+    const hash = crypto.createHash('sha256').update(buf).digest('hex');
+    // Connection drops at each 1MB mark; by then the 1s link has expired.
+    const { s, st } = signedLinkServer(buf, {
+      lifeMs: 1000,
+      pace: { bytes: 64 * 1024, ms: 100 },
+      cutAt: (off) => (off > 0 && off % MB === 0 ? off : null),
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'o.bin');
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/release`, '-o', out, '-n', '1', '--json'], { cwd: work, timeoutMs: 170000 });
+      assert.equal(r.code, 0, r.stderr.slice(-400));
+      assert.equal(H.sha256(out), hash);
+      assert.ok(refreshEvents(r) >= 3, `expected >= 3 refreshes, got ${refreshEvents(r)}`);
+      assert.ok(st.served < buf.length * 1.5, `resumed, not restarted (${(st.served / MB).toFixed(1)}MB served)`);
+    } finally {
+      s.close();
+    }
+  });
+
+  it('single-stream revoked link aborts fast with progress kept (R2)', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-single-revoked');
+    const buf = crypto.randomBytes(4 * MB);
+    // After the first link, the origin refuses for good (revoked).
+    const { s } = signedLinkServer(buf, {
+      lifeMs: 1000,
+      pace: { bytes: 64 * 1024, ms: 100 },
+      cutAt: (off) => (off >= MB ? 'once' : null),
+      release: (n) => (n > 1 ? 403 : null),
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'o.bin');
+      const t0 = Date.now();
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/release`, '-o', out, '-n', '1', '--json'], { cwd: work, timeoutMs: 110000 });
+      assert.equal(r.code, 1);
+      assert.match(r.stdout + r.stderr, /revoked|HTTP 403/);
+      assert.ok(Date.now() - t0 < 30000, `aborted fast (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
+      assert.ok(fs.existsSync(out + '.partial'), 'progress kept for a rerun');
+    } finally {
+      s.close();
+    }
+  });
+
   it('origin outage during refresh recovers', { timeout: 120000 }, async () => {
     const work = H.workdir('rel-outage');
     const buf = crypto.randomBytes(4 * MB);

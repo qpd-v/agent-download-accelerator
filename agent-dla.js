@@ -983,6 +983,48 @@ async function verifyOutput(outPath, manifestPath, expectSize = 0, onBad = null)
   return { bytes, sha: sha || null };
 }
 
+// Re-probe the original (unsigned) URL after a signed link expired. Shared
+// by the chunked and single-stream paths. A rate-limited probe (403/429 +
+// Retry-After, e.g. GitHub's secondary limit) waits once per file, bounded by
+// the deadline (finding 5). Throws CHANGED when the file was republished
+// (size or validators differ): kept bytes belong to the old version.
+async function reprobeSigned(originalTarget, info, state) {
+  let fresh;
+  try {
+    fresh = await getFileInfo(originalTarget);
+  } catch (e) {
+    const st = e && e.status;
+    if ((st === 403 || st === 429) && e.retryAfter > 0 && !state.rateWaited) {
+      state.rateWaited = true;
+      say(`Refresh rate-limited (HTTP ${st}), waiting ${e.retryAfter}s...`);
+      await sleepOrDeadline(Math.min(e.retryAfter, 120) * 1000);
+      fresh = await getFileInfo(originalTarget);
+    } else throw e;
+  }
+  if (fresh.size && fresh.size !== info.size) {
+    const e = new Error(`file changed mid-download (was ${fmtSize(info.size)}, now ${fmtSize(fresh.size)})`);
+    e.fatal = true;
+    e.code = 'CHANGED';
+    throw e;
+  }
+  if ((fresh.etag || null) !== (info.etag || null) || (fresh.mtime || null) !== (info.mtime || null)) {
+    // Republished under the same size: restart fresh rather than mix versions.
+    const e = new Error('file republished mid-download (validator changed)');
+    e.fatal = true;
+    e.code = 'CHANGED';
+    throw e;
+  }
+  return fresh;
+}
+// A definitive origin error on the refresh probe (direct 4xx) usually means
+// the link was revoked. Callers abort on the second consecutive one.
+function isDefinitiveProbeErr(e) {
+  return !!(e && e.fatal && e.status >= 400 && e.status < 500 && e.status !== 408 && e.status !== 429);
+}
+// Refreshes are capped per stretch without progress, not per file: a long
+// download over short-lived signed links may refresh many times (R1).
+const MAX_REFRESHES_WITHOUT_PROGRESS = 5;
+
 async function runDownload(targetUrl, retryOpts = {}) {
   const originalTarget = targetUrl;
   const staleDepth = retryOpts.staleDepth || 0;
@@ -1024,8 +1066,8 @@ async function runDownload(targetUrl, retryOpts = {}) {
   }
   // Completion receipts live in one hidden per-directory store, one file per
   // output (not one shared index): proves THIS tool produced this exact file
-  // (key covers origin+path+size+validator, not the query, so refreshed
-  // presigned URLs hit). Per-file receipts make parallel runs safe: no
+  // (key covers origin+path+query+size+validator; only signature/expiry
+  // params are dropped from the query, so refreshed presigned URLs hit). Per-file receipts make parallel runs safe: no
   // read-modify-write on a shared file, no shared temp name, and a corrupt
   // receipt can only affect its own output, never siblings.
   const fileKey = manifestKey(originalTarget, info.size, info.etag, info.mtime);
@@ -1213,14 +1255,61 @@ async function runDownload(targetUrl, retryOpts = {}) {
     let singleFails = 0;
     const singleValidators = (info.etag && !/^W\//i.test(info.etag)) ? { etag: info.etag, mtime: null }
       : (info.mtime ? { etag: null, mtime: info.mtime } : null);
+    // Signed-link refresh for single-stream (R2): same rules as the chunked
+    // path — re-probe the original URL on 401/403/410 from a redirected link,
+    // abort on the second consecutive definitive 4xx, and cap only refreshes
+    // that deliver no bytes (the .partial size proves progress).
+    let singleUrl = url;
+    let singleRefreshes = 0;
+    let singleRefreshStrikes = 0;
+    let partialAtRefresh = -1;
+    const singleRefreshState = { rateWaited: false };
+    const partialSize = () => { try { return fs.statSync(singlePartial).size; } catch { return 0; } };
     while (true) {
       checkDeadline();
       try {
-        await downloadSingle(url, outPath, nextProxy(), info.size, 0, fileKey, singleValidators);
+        await downloadSingle(singleUrl, outPath, nextProxy(), info.size, 0, fileKey, singleValidators);
         break;
       } catch (e) {
         const cls = classifyErr(e);
-        if (cls === 'fatal' || e.code === 'ENOTFOUND') { emit({ event: 'error', scope: 'single', message: e.message }); throw e; }
+        const st = e && e.status;
+        if ((st === 401 || st === 403 || st === 410) && singleUrl !== originalTarget) {
+          const got = partialSize();
+          if (got > partialAtRefresh && partialAtRefresh >= 0) singleRefreshes = 0;
+          partialAtRefresh = got;
+          if (singleRefreshes >= MAX_REFRESHES_WITHOUT_PROGRESS) {
+            const re = new Error('signed link refresh failed repeatedly, aborting');
+            emit({ event: 'error', scope: 'single', message: re.message });
+            throw re;
+          }
+          singleRefreshes++;
+          let fresh = null;
+          try {
+            fresh = await reprobeSigned(originalTarget, info, singleRefreshState);
+          } catch (re) {
+            if (re && re.code === 'CHANGED') {
+              // Republished mid-download: kept bytes are the old version.
+              try { fs.unlinkSync(singlePartial); } catch {}
+              try { fs.unlinkSync(singleSidecar); } catch {}
+              if (staleDepth < 2) return runDownload(targetUrl, { forceSingle, staleDepth: staleDepth + 1, isRetry: true });
+              emit({ event: 'error', scope: 'single', message: re.message });
+              throw re;
+            }
+            if (re && re.message === 'deadline exceeded') { emit({ event: 'error', scope: 'single', message: re.message }); throw re; }
+            if (isDefinitiveProbeErr(re) && ++singleRefreshStrikes >= 2) {
+              emit({ event: 'error', scope: 'single', message: re.message });
+              throw new Error(`signed link revoked: ${re.message} (partial kept at ${singlePartial}, rerun to resume)`);
+            }
+            // first strike or transient probe blip: retry with backoff below
+          }
+          if (fresh) {
+            singleRefreshStrikes = 0;
+            emit({ event: 'signed-refresh', from: displayUrl(singleUrl, true), to: displayUrl(fresh.finalUrl, true) });
+            say('Signed link expired, refreshed.');
+            singleUrl = fresh.finalUrl;
+            continue; // resume immediately with the fresh link
+          }
+        } else if (cls === 'fatal' || e.code === 'ENOTFOUND') { emit({ event: 'error', scope: 'single', message: e.message }); throw e; }
         singleFails++;
         checkDeadline();
         if (singleFails > MAX_RETRIES) {
@@ -1409,10 +1498,11 @@ async function runDownload(targetUrl, retryOpts = {}) {
   const badProxies = new Set();
   const mirrorStrikes = new Map();
   let primaryUrl = url;
-  let signedRefreshes = 0;
+  let signedRefreshes = 0; // refreshes since the download last made progress
+  let bytesSinceRefresh = 0;
   let refreshingSigned = null;
   let refreshDefinitiveFails = 0; // consecutive definitive 4xx on the refresh probe
-  let refreshRateWaited = false; // one Retry-After wait per file (finding 5)
+  const refreshState = { rateWaited: false }; // one Retry-After wait per file (finding 5)
   function pickSrc(job) {
     if (job.src && !badMirrors.has(job.src)) return job.src;
     for (const s of SOURCES) { if (!badMirrors.has(s) && s !== primaryUrl) return s; }
@@ -1429,7 +1519,13 @@ async function runDownload(targetUrl, retryOpts = {}) {
   function isDirectPath(src, proxy) { return !proxy && src === primaryUrl; }
   async function refreshSignedUrl(job) {
     // 401/403/410 from a redirected primary: the signed link likely expired.
-    if (signedRefreshes >= 5) {
+    // Bytes received since the last refresh prove the refreshed link worked:
+    // only refreshes that deliver nothing count toward the cap (R1).
+    if (!refreshingSigned) {
+      if (bytesSinceRefresh > 0) signedRefreshes = 0;
+      bytesSinceRefresh = 0;
+    }
+    if (signedRefreshes >= MAX_REFRESHES_WITHOUT_PROGRESS) {
       const e = new Error('signed link refresh failed repeatedly, aborting');
       e.fatal = true;
       throw e;
@@ -1437,35 +1533,8 @@ async function runDownload(targetUrl, retryOpts = {}) {
     if (refreshingSigned) { await refreshingSigned.catch(() => {}); return job.src === primaryUrl; }
     refreshingSigned = (async () => {
       signedRefreshes++;
-      let fresh;
-      try {
-        fresh = await getFileInfo(originalTarget);
-      } catch (e) {
-        const st = e && e.status;
-        // Rate-limited refresh (e.g. GitHub's secondary limit answers 403 +
-        // Retry-After): wait once (bounded by the deadline), then try once more.
-        if ((st === 403 || st === 429) && e.retryAfter > 0 && !refreshRateWaited) {
-          refreshRateWaited = true;
-          say(`Refresh rate-limited (HTTP ${st}), waiting ${e.retryAfter}s...`);
-          await sleepOrDeadline(Math.min(e.retryAfter, 120) * 1000);
-          fresh = await getFileInfo(originalTarget);
-        } else throw e;
-      }
-      if (fresh.size && fresh.size !== size) {
-        const e = new Error(`file changed mid-download (was ${fmtSize(size)}, now ${fmtSize(fresh.size)})`);
-        e.fatal = true;
-        e.code = 'CHANGED';
-        throw e;
-      }
+      const fresh = await reprobeSigned(originalTarget, info, refreshState);
       const freshValidator = (fresh.etag && !/^W\//i.test(fresh.etag)) ? fresh.etag : (fresh.mtime || null);
-      if ((fresh.etag || null) !== (info.etag || null) || (fresh.mtime || null) !== (info.mtime || null)) {
-        // Republished under the same size: kept bytes belong to the old
-        // version. Restart fresh rather than mix versions.
-        const e = new Error('file republished mid-download (validator changed)');
-        e.fatal = true;
-        e.code = 'CHANGED';
-        throw e;
-      }
       const old = primaryUrl;
       primaryUrl = fresh.finalUrl;
       PRIMARY_VALIDATOR = freshValidator;
@@ -1482,7 +1551,7 @@ async function runDownload(targetUrl, retryOpts = {}) {
       // revoked: abort — but only on the SECOND consecutive one, so a
       // one-off 403 (flap) gets one more chance (finding 5). Anything else
       // (DNS, reset, 5xx, timeout) returns false: retry later on another path.
-      if (e && e.fatal && e.status >= 400 && e.status < 500 && e.status !== 408 && e.status !== 429) {
+      if (isDefinitiveProbeErr(e)) {
         if (++refreshDefinitiveFails >= 2) throw e;
         return false; // first strike: requeue, confirm on the next 403
       }
@@ -1496,7 +1565,10 @@ async function runDownload(targetUrl, retryOpts = {}) {
   // returns true on success, false to requeue, { fatal } to abort everything
   async function runJob(job) {
     const ATTEMPTS = MAX_RETRIES === 0 ? 1 : Math.min(Math.max(RETRIES + 1, PROXIES.length || 0), 16);
-    const track = (d) => active.set(job.i, (active.get(job.i) || 0) + d);
+    // Only bytes fetched with the current primary link prove a refresh
+    // worked; in-flight connections on older links don't (R1).
+    let attemptUrl = null;
+    const track = (d) => { if (attemptUrl === primaryUrl) bytesSinceRefresh += d; active.set(job.i, (active.get(job.i) || 0) + d); };
     const finishAttempt = (okBytes) => {
       inflight.delete(job.i);
       active.delete(job.i);
@@ -1518,6 +1590,7 @@ async function runDownload(targetUrl, retryOpts = {}) {
       inflight.set(job.i, { job, t0: Date.now(), token });
       try {
         job.lastVia = redactProxy(proxy);
+        attemptUrl = src;
         const got = await downloadRange(src, job.start, job.end, outFd, proxy, track, token, 0, size, src === primaryUrl ? PRIMARY_VALIDATOR : null, src === primaryUrl ? RUN_VALIDATORS : null);
         finishAttempt(got);
         return true;
@@ -1573,7 +1646,7 @@ async function runDownload(targetUrl, retryOpts = {}) {
         if (e.code === 'STALE_RANGE') return { stale: true }; // range ignored: single-stream fallback
         if ((status === 401 || status === 403 || status === 410) && primaryUrl !== originalTarget) {
           try {
-            if (await refreshSignedUrl(job)) return false; // requeue with the fresh link
+            if (await refreshSignedUrl(job)) continue; // retry now with the fresh link, no backoff
           } catch (re) {
             if (re && re.code === 'CHANGED') return { fresh: true };
             return { fatal: re }; // definitive (revoked/cap): abort, don't requeue
@@ -1596,6 +1669,7 @@ async function runDownload(targetUrl, retryOpts = {}) {
     inflight.set(job.i, { job, t0: Date.now(), token });
     try {
       job.lastVia = 'direct';
+      attemptUrl = primaryUrl;
       const got = await downloadRange(primaryUrl, job.start, job.end, outFd, null, track, token, 0, size, PRIMARY_VALIDATOR, RUN_VALIDATORS);
       finishAttempt(got);
       return true;
@@ -1616,7 +1690,7 @@ async function runDownload(targetUrl, retryOpts = {}) {
         const status = e && e.status;
         if ((status === 401 || status === 403 || status === 410) && primaryUrl !== originalTarget) {
           try {
-            if (await refreshSignedUrl(job)) return false;
+            if (await refreshSignedUrl(job)) return 'refreshed'; // requeue now: a backoff could outlive the fresh link
           } catch (re) {
             if (re && re.code === 'CHANGED') return { fresh: true };
             return { fatal: re }; // definitive (revoked/cap): abort, don't requeue
@@ -1662,6 +1736,7 @@ async function runDownload(targetUrl, retryOpts = {}) {
       if (down) return;
       if (r === true) { pending--; continue; }
       if (r === 'split') { queue.push(j); continue; } // first half still pending, requeue it
+      if (r === 'refreshed') { queue.push(j); continue; } // fresh signed link: retry now (refresh cap bounds this)
       if (r && r.stale) {
         staleRestart = true;
         pending = 0;

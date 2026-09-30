@@ -77,7 +77,11 @@ strings, and fragments; `--redact` extends that to human logs.
   from a redirect) trigger a re-probe of the original URL; a revoked link
   (definitive origin 4xx on re-probe, twice in a row) aborts fast while a
   one-off 403 gets a second chance, a 403/429 with Retry-After waits once,
-  and transient outages requeue.
+  and transient outages requeue. This applies to chunked and single-stream
+  (`-n 1`, no-Range servers) downloads alike. A fresh link is used right
+  away (no backoff), and there is no limit on refreshes that keep delivering
+  bytes, so long downloads over short-lived links finish; 5 refreshes in a
+  row that deliver nothing abort.
   `If-Range` validators (strong ETags, primary only; single-stream resume too)
   guard against the file changing mid-download; stale ranges fall back to
   single-stream, repeated validator flapping falls back as well — resumed
