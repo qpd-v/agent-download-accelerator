@@ -1253,6 +1253,7 @@ async function runDownload(targetUrl, retryOpts = {}) {
     const singleSidecar = outPath + '.single.json';
     shutdownHandler = (sig) => { emit({ event: 'interrupted', signal: sig, output: outPath }); console.error(`\nInterrupted (${sig}). Partial kept at ${singlePartial} — rerun to resume.`); process.exit(sig === 'SIGTERM' ? 143 : 130); };
     let singleFails = 0;
+    let lastFailPartial = -1; // .partial size at the previous failure: growth = progress, resets the retry count
     const singleValidators = (info.etag && !/^W\//i.test(info.etag)) ? { etag: info.etag, mtime: null }
       : (info.mtime ? { etag: null, mtime: info.mtime } : null);
     // Signed-link refresh for single-stream (R2): same rules as the chunked
@@ -1310,6 +1311,9 @@ async function runDownload(targetUrl, retryOpts = {}) {
             continue; // resume immediately with the fresh link
           }
         } else if (cls === 'fatal' || e.code === 'ENOTFOUND') { emit({ event: 'error', scope: 'single', message: e.message }); throw e; }
+        const grew = partialSize();
+        if (lastFailPartial >= 0 && grew > lastFailPartial) singleFails = 0;
+        lastFailPartial = grew;
         singleFails++;
         checkDeadline();
         if (singleFails > MAX_RETRIES) {

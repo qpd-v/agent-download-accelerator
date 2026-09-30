@@ -1435,6 +1435,35 @@ describe('reliability', () => {
     }
   });
 
+  it('single-stream retry budget resets on progress: many drops, --max-retries 2', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-single-retry-reset');
+    const buf = crypto.randomBytes(4 * MB);
+    const hash = crypto.createHash('sha256').update(buf).digest('hex');
+    let gets = 0;
+    // Every data connection dies after ~512KB: 8 drops, far more than
+    // --max-retries 2, but each attempt advances, so it must still finish.
+    const s = require('http').createServer((q, res) => {
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : buf.length - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${buf.length}` } : {}) });
+      if (b - a < 64 * 1024) { res.end(buf.subarray(a, b + 1)); return; } // probe
+      gets++;
+      const stop = Math.min(b + 1, a + 512 * 1024);
+      res.write(buf.subarray(a, stop));
+      if (stop > b) res.end(); else setTimeout(() => { try { q.socket.destroy(); } catch {} }, 100);
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'o.bin');
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/f.bin`, '-o', out, '-n', '1', '--max-retries', '2', '--json'], { cwd: work });
+      assert.equal(r.code, 0, r.stderr.slice(-300));
+      assert.equal(H.sha256(out), hash);
+      assert.ok(gets >= 8, `expected >= 8 data connections, got ${gets}`);
+    } finally {
+      s.close();
+    }
+  });
+
   it('single-stream revoked link aborts fast with progress kept (R2)', { timeout: 120000 }, async () => {
     const work = H.workdir('rel-single-revoked');
     const buf = crypto.randomBytes(4 * MB);
