@@ -1296,7 +1296,7 @@ async function runDownloadInner(targetUrl, retryOpts = {}) {
     const singleSidecar = outPath + '.single.json';
     shutdownHandler = (sig) => { emit({ event: 'interrupted', signal: sig, output: outPath }); console.error(`\nInterrupted (${sig}). Partial kept at ${singlePartial} — rerun to resume.`); process.exit(sig === 'SIGTERM' ? 143 : 130); };
     let singleFails = 0;
-    let lastFailPartial = -1; // .partial size at the previous failure: growth = progress, resets the retry count
+    let lastFailPartial = 0; // .partial size at the last retry-count reset (set below)
     const singleValidators = (info.etag && !/^W\//i.test(info.etag)) ? { etag: info.etag, mtime: null }
       : (info.mtime ? { etag: null, mtime: info.mtime } : null);
     // Signed-link refresh for single-stream (R2): same rules as the chunked
@@ -1309,6 +1309,7 @@ async function runDownloadInner(targetUrl, retryOpts = {}) {
     let partialAtRefresh = -1;
     const singleRefreshState = { rateWaited: false };
     const partialSize = () => { try { return fs.statSync(singlePartial).size; } catch { return 0; } };
+    lastFailPartial = partialSize();
     while (true) {
       checkDeadline();
       try {
@@ -1354,9 +1355,10 @@ async function runDownloadInner(targetUrl, retryOpts = {}) {
             continue; // resume immediately with the fresh link
           }
         } else if (cls === 'fatal' || e.code === 'ENOTFOUND') { emit({ event: 'error', scope: 'single', message: e.message }); throw e; }
+        // Reset only on meaningful progress since the last reset: a server
+        // trickling a few bytes per attempt must still exhaust --max-retries.
         const grew = partialSize();
-        if (lastFailPartial >= 0 && grew > lastFailPartial) singleFails = 0;
-        lastFailPartial = grew;
+        if (grew - lastFailPartial >= Math.max(64 * 1024, Math.floor((info.size || 0) / 100))) { singleFails = 0; lastFailPartial = grew; }
         singleFails++;
         checkDeadline();
         if (singleFails > MAX_RETRIES) {
@@ -1462,8 +1464,10 @@ async function runDownloadInner(targetUrl, retryOpts = {}) {
         p += take;
         if (cur.len >= target) { pushJob(cur.start, p - 1); cur = null; }
       }
+      // A job never spans a gap boundary: it would re-download bytes the
+      // manifest already holds (and `len` would understate its true extent).
+      if (cur) { pushJob(cur.start, cur.start + cur.len - 1); cur = null; }
     }
-    if (cur) pushJob(cur.start, cur.start + cur.len - 1);
   }
 
   let doneBytes = doneIv.reduce((t, [s, e]) => t + (e - s + 1), 0);

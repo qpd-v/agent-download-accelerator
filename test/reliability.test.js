@@ -1464,6 +1464,70 @@ describe('reliability', () => {
     }
   });
 
+  it('single-stream trickle (bytes per attempt) still exhausts --max-retries', { timeout: 60000 }, async () => {
+    const work = H.workdir('rel-single-trickle');
+    const buf = crypto.randomBytes(1 * MB);
+    const s = require('http').createServer((q, res) => {
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : buf.length - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${buf.length}` } : {}) });
+      if (b - a < 64 * 1024) { res.end(buf.subarray(a, b + 1)); return; } // probe
+      res.write(buf.subarray(a, a + 100)); // 100 bytes, then drop
+      setTimeout(() => { try { q.socket.destroy(); } catch {} }, 50);
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const t0 = Date.now();
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/f.bin`, '-o', path.join(work, 'o.bin'), '-n', '1', '--max-retries', '2', '--json'], { cwd: work, timeoutMs: 50000 });
+      assert.equal(r.code, 1);
+      assert.match(r.stdout + r.stderr, /single-stream failed 2x/);
+      assert.ok(Date.now() - t0 < 30000, 'bounded');
+    } finally {
+      s.close();
+    }
+  });
+
+  it('resume plans no job across bytes the manifest already holds', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-plan-gaps');
+    const buf = crypto.randomBytes(24 * MB);
+    const hash = crypto.createHash('sha256').update(buf).digest('hex');
+    const ranges = [];
+    const s = require('http').createServer((q, res) => {
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : buf.length - 1;
+      if (m) ranges.push([a, b]);
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${buf.length}` } : {}) });
+      res.end(buf.subarray(a, b + 1));
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'o.bin');
+      // Hand-built state: done [4MB,12MB) and [16MB,20MB); everything else missing.
+      const url = `http://127.0.0.1:${s.address().port}/f.bin`;
+      const first = await H.runAccel([url, '-o', out, '-n', '4', '--json'], { cwd: work });
+      assert.equal(first.code, 0);
+      fs.rmSync(out);
+      fs.rmSync(path.join(work, '.agent-dla'), { recursive: true, force: true });
+      const partial = Buffer.alloc(24 * MB);
+      buf.copy(partial, 4 * MB, 4 * MB, 12 * MB);
+      buf.copy(partial, 16 * MB, 16 * MB, 20 * MB);
+      fs.writeFileSync(out + '.partial', partial);
+      const key = `${new URL(url).origin}/f.bin|${24 * MB}||`;
+      fs.writeFileSync(out + '.manifest.json', JSON.stringify({ key, done: [[4 * MB, 12 * MB - 1], [16 * MB, 20 * MB - 1]], active: {} }));
+      ranges.length = 0;
+      const r = await H.runAccel([url, '-o', out, '-n', '4', '--json'], { cwd: work });
+      assert.equal(r.code, 0, r.stderr.slice(-300));
+      assert.equal(H.sha256(out), hash);
+      const inDone = (a, b) => [[4 * MB, 12 * MB - 1], [16 * MB, 20 * MB - 1]].some(([s0, e0]) => a <= e0 && b >= s0);
+      for (const [a, b] of ranges) {
+        if (a === 0 && b === 0) continue; // probe
+        assert.ok(!inDone(a, b), `job [${a}, ${b}] overlaps bytes already in the manifest`);
+      }
+    } finally {
+      s.close();
+    }
+  });
+
   it('a second run into the same output refuses; stale locks are taken over (N2)', { timeout: 120000 }, async () => {
     const work = H.workdir('rel-output-lock');
     const buf = crypto.randomBytes(4 * MB);
