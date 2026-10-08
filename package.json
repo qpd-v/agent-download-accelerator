@@ -3,6 +3,14 @@
   "version": "1.0.0",
   "description": "Agent Download Accelerator: parallel Range chunks, mirrors, proxy rotation, resume",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qpd-v/agent-download-accelerator.git"
+  },
+  "homepage": "https://github.com/qpd-v/agent-download-accelerator#readme",
+  "bugs": {
+    "url": "https://github.com/qpd-v/agent-download-accelerator/issues"
+  },
   "engines": {
     "node": ">=22"
   },

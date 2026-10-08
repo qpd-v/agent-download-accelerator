@@ -1489,11 +1489,21 @@ describe('reliability', () => {
         for (const n of ['1', '4']) {
           const c = spawn('node', [H.AGENT_DLA, url, '-o', out, '-n', n], { cwd: work });
           const closed = new Promise((r) => c.on('close', r));
-          await H.sleep(1500);
+          // Kill only once real progress is on disk (a fixed sleep flakes under load).
+          const progressed = () => {
+            try {
+              if (n === '1') return fs.statSync(out + '.partial').size > 128 * 1024 && fs.existsSync(out + '.single.json');
+              const m = JSON.parse(fs.readFileSync(out + '.manifest.json', 'utf8'));
+              return (m.done || []).length > 0 || Object.keys(m.active || {}).length > 0;
+            } catch { return false; }
+          };
+          for (let i = 0; i < 300 && !progressed(); i++) await H.sleep(100);
+          assert.ok(progressed(), 'first run made progress before the kill');
           c.kill();
           await closed;
           const r = await H.runAccel([url, '-o', out, '-n', n, '--json'], { cwd: work });
           assert.equal(r.code, 0);
+          assert.match(r.stderr, /Resuming/, 'second run resumed');
           assert.equal(/no ETag or Last-Modified/.test(r.stderr), !withEtag, `warning iff no validators (etag=${withEtag}, -n ${n})`);
           fs.rmSync(out, { force: true });
           fs.rmSync(path.join(work, '.agent-dla'), { recursive: true, force: true });
@@ -1501,6 +1511,233 @@ describe('reliability', () => {
       } finally {
         s.close();
       }
+    }
+  });
+
+  // ---- Codex review findings (round 6) ----
+  const rangeHeaders = (buf, q) => {
+    const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+    const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : buf.length - 1;
+    return { a, b, status: m ? 206 : 200, headers: { 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${buf.length}` } : {}) } };
+  };
+
+  it('a refresh in flight is joined, not rejected by the cap (pending fifth refresh)', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-pending-refresh');
+    const buf = crypto.randomBytes(4 * MB);
+    const hash = crypto.createHash('sha256').update(buf).digest('hex');
+    let links = 0;
+    // Links 1-5 refuse every data request (born bad); link 6 works. Each
+    // re-probe is slow, so all four workers pile up while the fifth refresh
+    // is pending: they must join it instead of tripping the cap.
+    const s = require('http').createServer((q, res) => {
+      const u = new URL(q.url, 'http://x');
+      if (u.pathname === '/release') {
+        const go = () => { links++; res.writeHead(302, { Location: `/signed?id=${links}` }); res.end(); };
+        if (links === 0) go(); else setTimeout(go, 600);
+        return;
+      }
+      const { a, b, status, headers } = rangeHeaders(buf, q);
+      const id = +u.searchParams.get('id');
+      if (id < 6 && b - a > 0) { res.writeHead(403); res.end('bad link'); return; }
+      res.writeHead(status, headers);
+      res.end(buf.subarray(a, b + 1));
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'o.bin');
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/release`, '-o', out, '-n', '4', '--json'], { cwd: work, timeoutMs: 100000 });
+      assert.equal(r.code, 0, r.stderr.slice(-300) + r.stdout.slice(-300));
+      assert.equal(H.sha256(out), hash);
+    } finally {
+      s.close();
+    }
+  });
+
+  it('a fresh signed link is used immediately (no 300ms pause before the retry)', { timeout: 60000 }, async () => {
+    const work = H.workdir('rel-refresh-immediate');
+    const buf = crypto.randomBytes(1 * MB);
+    const hash = crypto.createHash('sha256').update(buf).digest('hex');
+    let links = 0;
+    // The first link is dead on arrival; every refreshed link lives 280ms,
+    // shorter than the old inter-attempt pause.
+    const s = require('http').createServer((q, res) => {
+      const u = new URL(q.url, 'http://x');
+      if (u.pathname === '/release') {
+        links++;
+        res.writeHead(302, { Location: `/signed?exp=${links === 1 ? 0 : Date.now() + 280}` });
+        res.end();
+        return;
+      }
+      const { a, b, status, headers } = rangeHeaders(buf, q);
+      if (b - a > 0 && Date.now() > +u.searchParams.get('exp')) { res.writeHead(403); res.end('expired'); return; }
+      res.writeHead(status, headers);
+      res.end(buf.subarray(a, b + 1));
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'o.bin');
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/release`, '-o', out, '-n', '1', '--json'], { cwd: work, timeoutMs: 50000 });
+      assert.equal(r.code, 0, r.stderr.slice(-300) + r.stdout.slice(-300));
+      assert.equal(H.sha256(out), hash);
+      assert.ok(links <= 3, `single-stream: one refresh should suffice (saw ${links - 1})`);
+      // chunked path too: the old 300ms pause burned a refresh per attempt
+      const out2 = path.join(work, 'o2.bin');
+      links = 0;
+      const r2 = await H.runAccel([`http://127.0.0.1:${s.address().port}/release`, '-o', out2, '-n', '2', '--json'], { cwd: work, timeoutMs: 50000 });
+      assert.equal(r2.code, 0, r2.stderr.slice(-300) + r2.stdout.slice(-300));
+      assert.equal(H.sha256(out2), hash);
+      assert.ok(links <= 3, `chunked: one refresh should suffice (saw ${links - 1})`);
+    } finally {
+      s.close();
+    }
+  });
+
+  it('a discarded .partial does not freeze the single-stream retry baseline', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-single-baseline');
+    const buf = crypto.randomBytes(4 * MB);
+    const hash = crypto.createHash('sha256').update(buf).digest('hex');
+    const s = require('http').createServer((q, res) => {
+      const { a, b, status, headers } = rangeHeaders(buf, q);
+      res.writeHead(status, headers);
+      if (b - a < 64 * 1024) { res.end(buf.subarray(a, b + 1)); return; } // probe
+      const stop = Math.min(b + 1, a + 512 * 1024);
+      res.write(buf.subarray(a, stop));
+      if (stop > b) res.end(); else setTimeout(() => { try { q.socket.destroy(); } catch {} }, 100);
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'o.bin');
+      // A stranger's full-size .partial (no sidecar): single-stream discards it.
+      fs.writeFileSync(out + '.partial', Buffer.alloc(4 * MB));
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/f.bin`, '-o', out, '-n', '1', '--max-retries', '2', '--json'], { cwd: work });
+      assert.equal(r.code, 0, r.stderr.slice(-300));
+      assert.equal(H.sha256(out), hash);
+    } finally {
+      s.close();
+    }
+  });
+
+  // The lock code is exercised in-process with fake pids and a hooked fs so
+  // the exact interleavings from the review are deterministic.
+  function lockHarness(pid, alive, fsHooks = {}) {
+    const src = fs.readFileSync(H.AGENT_DLA, 'utf8');
+    const from = src.indexOf('const heldLocks = new Set();');
+    const to = src.indexOf("process.on('exit', () => { for (const l of heldLocks)");
+    assert.ok(from > 0 && to > from, 'lock block located');
+    const fakeProcess = { pid, kill: (p) => { if (alive.has(p)) return true; const e = new Error('ESRCH'); e.code = 'ESRCH'; throw e; } };
+    const hooked = new Proxy(fs, { get(t, k) { const f = t[k]; return typeof f === 'function' ? (...args) => { if (fsHooks.before) fsHooks.before(k, args); return f.apply(t, args); } : f; } });
+    const warnings = [];
+    const mod = new Function('fs', 'path', 'process', 'warn', `${src.slice(from, to)}; return { acquireOutputLock, heldLocks };`)(hooked, path, fakeProcess, (m) => warnings.push(m));
+    return { ...mod, warnings };
+  }
+
+  it('lock file is never visible empty, and stale takeover cannot displace a live lock (N2 races)', () => {
+    const work = H.workdir('rel-lock-sim');
+    const out = path.join(work, 'o.bin');
+    const lockPath = out + '.partial.lock';
+    const alive = new Set([111, 222]);
+
+    // 1. Never empty: before every fs call, an existing lock must hold a pid.
+    let emptySeen = false;
+    const A = lockHarness(111, alive, { before: () => { try { if (fs.readFileSync(lockPath, 'utf8') === '') emptySeen = true; } catch {} } });
+    const relA = A.acquireOutputLock(out);
+    assert.ok(typeof relA === 'function', 'A holds the lock');
+    assert.equal(emptySeen, false, 'lock never observable empty (a racing stale-takeover would delete it)');
+    assert.equal(fs.readFileSync(lockPath, 'utf8'), '111');
+
+    // 2. Live holder: a second process refuses.
+    const B = lockHarness(222, alive);
+    assert.throws(() => B.acquireOutputLock(out), /already writing/);
+    assert.equal(fs.readFileSync(lockPath, 'utf8'), '111', 'refusal leaves the live lock alone');
+
+    // 3. Release removes only our own lock.
+    fs.writeFileSync(lockPath, '222'); // a successor now owns it
+    relA();
+    assert.equal(fs.readFileSync(lockPath, 'utf8'), '222', "A's release must not delete B's live lock");
+    fs.unlinkSync(lockPath);
+
+    // 4. Takeover race: stale lock (pid 999 dead). Just as C moves it aside,
+    // D completes a full takeover and holds a live lock; C must not displace D.
+    fs.writeFileSync(lockPath, '999');
+    alive.add(333).add(444);
+    let D = null;
+    const Dh = lockHarness(444, alive);
+    let injected = false;
+    const C = lockHarness(333, alive, {
+      before: (k) => { if (k === 'renameSync' && !injected) { injected = true; D = Dh.acquireOutputLock(out); } },
+    });
+    assert.throws(() => C.acquireOutputLock(out), /already writing/, 'C must refuse: D took the stale lock first');
+    assert.ok(typeof D === 'function', 'D holds the lock');
+    assert.equal(fs.readFileSync(lockPath, 'utf8'), '444', "D's live lock intact");
+    D();
+    assert.ok(!fs.existsSync(lockPath));
+    assert.deepEqual(fs.readdirSync(work).filter((f) => /.(tmp|stale)/.test(f)), [], 'no temp/stale leftovers');
+
+    // 5. Garbage/empty locks are stale; an unwritable directory fails open WITH a warning.
+    for (const junk of ['', 'garbage', '0', '-1', '3.7']) {
+      fs.writeFileSync(lockPath, junk);
+      const rel = lockHarness(555, alive).acquireOutputLock(out);
+      assert.ok(typeof rel === 'function', `junk lock "${junk}" taken over`);
+      rel();
+    }
+    const W = lockHarness(666, alive, { before: (k, args) => { if (k === 'writeFileSync' && /.tmp$/.test(String(args[0]))) { const e = new Error('no space'); e.code = 'ENOSPC'; throw e; } } });
+    assert.equal(W.acquireOutputLock(out), null, 'cannot create a lock: continue unlocked');
+    assert.ok(W.warnings.some((m) => /cannot create output lock/.test(m)), 'and say so');
+    assert.ok(!fs.existsSync(lockPath), 'no half-created lock left behind');
+  });
+
+  it('unknown-size resume restarts instead of accepting a short 206', { timeout: 60000 }, async () => {
+    const work = H.workdir('rel-unknown-size');
+    const buf = crypto.randomBytes(200 * 1024);
+    const hash = crypto.createHash('sha256').update(buf).digest('hex');
+    let drops = 0;
+    // No Content-Length (chunked, size unknown). First request streams 40KB
+    // then dies; a Range request is answered with a truncated 206.
+    const s = require('http').createServer((q, res) => {
+      const m = /bytes=(\d+)-/.exec(q.headers.range || '');
+      if (m && +m[1] === 0) { res.writeHead(200); res.end(); return; } // probe: nothing useful
+      if (m && +m[1] > 0) {
+        const a = +m[1];
+        res.writeHead(206, { 'Content-Range': `bytes ${a}-${a + 1023}/${buf.length}` });
+        res.end(buf.subarray(a, a + 1024)); // truncated tail
+        return;
+      }
+      res.writeHead(200);
+      if (drops++ === 0) { res.write(buf.subarray(0, 40 * 1024)); setTimeout(() => { try { q.socket.destroy(); } catch {} }, 100); return; }
+      res.end(buf);
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const out = path.join(work, 'o.bin');
+      const url = `http://127.0.0.1:${s.address().port}/f.bin`;
+      const r = await H.runAccel([url, '-o', out, '-n', '1', '--json'], { cwd: work });
+      if (r.code === 0) assert.equal(H.sha256(out), hash, 'exit 0 must mean the exact file');
+      // Whatever happened, a short file must never be certified.
+      if (fs.existsSync(out)) assert.equal(fs.statSync(out).size, buf.length, 'no truncated output published');
+    } finally {
+      s.close();
+    }
+  });
+
+  it('server-chosen names that look like staging files are refused', { timeout: 60000 }, async () => {
+    const work = H.workdir('rel-staging-names');
+    const s = require('http').createServer((q, res) => {
+      res.writeHead(200, { 'Content-Length': 5 });
+      res.end('hello');
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      for (const name of ['item.partial', 'item.manifest.json', 'item.single.json', 'item.partial.lock']) {
+        const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/${name}`, '--json'], { cwd: work });
+        assert.equal(r.code, 1, name);
+        assert.match(r.stdout + r.stderr, /staging file/);
+        assert.ok(!fs.existsSync(path.join(work, name)), `${name} not written`);
+      }
+      // An explicit -o is the user's choice and still works.
+      const r2 = await H.runAccel([`http://127.0.0.1:${s.address().port}/item.partial`, '-o', path.join(work, 'ok.bin'), '--json'], { cwd: work });
+      assert.equal(r2.code, 0);
+    } finally {
+      s.close();
     }
   });
 

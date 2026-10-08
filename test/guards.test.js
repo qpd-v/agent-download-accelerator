@@ -6,6 +6,17 @@ const H = require('./helpers');
 
 const BADHASH = '0'.repeat(64);
 
+describe('version', () => {
+  it('--version / -V print the package version and exit 0', async () => {
+    const pkg = require('../package.json');
+    for (const flag of ['--version', '-V']) {
+      const r = await H.runAccel([flag]);
+      assert.equal(r.code, 0);
+      assert.equal(r.stdout.trim(), pkg.version);
+    }
+  });
+});
+
 describe('guards', () => {
   it('sha256/expect-size/expect-type pass, hash in done event', { timeout: 120000 }, async () => {
     const work = H.workdir('guards-ok');

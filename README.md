@@ -114,6 +114,11 @@ strings, and fragments; `--redact` extends that to human logs.
   while a refreshed presigned URL resumes the same file with or without an
   ETag.
   A republished file (validator change) restarts clean instead of mixing versions.
+  Identity does not include credentials: if the same URL serves different
+  content per account (userinfo, `--header "Authorization: ..."`, cookies),
+  use a distinct `-o` name per account so receipts and partials are not shared.
+  Server-chosen names ending in `.partial`, `.manifest.json`, `.single.json`,
+  `.receipt.json` or `.lock` are refused (use `-o`).
   If the server sends neither ETag nor Last-Modified, a same-size republish
   during a resume cannot be detected; the tool warns once when resuming in
   that case. Pass `--sha256` to verify the result.

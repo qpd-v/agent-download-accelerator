@@ -19,6 +19,7 @@ function collect(v, arr) { arr.push(v); return arr; }
 program
   .name('agent-dla')
   .description('Agent Download Accelerator: parallel Range chunks, mirrors, proxy rotation, resume')
+  .version(require('./package.json').version, '-V, --version', 'print the version')
   .argument('[url]', 'file URL to download (or use --list)')
   .option('-o, --output <file>', 'output file path')
   .option('--dir <folder>', 'download into this folder (created if needed)')
@@ -165,23 +166,58 @@ function pidAlive(pid) {
 function acquireOutputLock(outPath) {
   const lockPath = path.resolve(outPath) + '.partial.lock';
   if (heldLocks.has(lockPath)) return null; // same process re-entering (fresh/stale restart)
-  for (let attempt = 0; attempt < 3; attempt++) {
+  const release = () => {
+    heldLocks.delete(lockPath);
+    // Remove only a lock that still names this process (never a successor's).
+    try { if (parseInt(fs.readFileSync(lockPath, 'utf8'), 10) === process.pid) fs.unlinkSync(lockPath); } catch {}
+  };
+  // The lock must never be visible empty: write the pid to a private temp file
+  // and hard-link it into place (atomic; EEXIST if held). Filesystems without
+  // hard links fall back to O_EXCL create + write.
+  const tmp = `${lockPath}.${process.pid}.${Date.now()}.tmp`;
+  const create = () => {
     try {
-      const fd = fs.openSync(lockPath, 'wx');
-      try { fs.writeSync(fd, String(process.pid)); } finally { fs.closeSync(fd); }
-      heldLocks.add(lockPath);
-      return () => { heldLocks.delete(lockPath); try { fs.unlinkSync(lockPath); } catch {} };
-    } catch (e) {
-      if (e.code !== 'EEXIST') return null; // can't lock (read-only dir etc.): don't block the download
-      let pid = NaN;
-      try { pid = parseInt(fs.readFileSync(lockPath, 'utf8'), 10); } catch (re) { if (re.code === 'ENOENT') continue; }
-      if (pidAlive(pid) && pid !== process.pid) {
-        const err = new Error(`another agent-dla (pid ${pid}) is already writing "${path.basename(outPath)}" (if not, delete ${lockPath})`);
-        err.fatal = true;
-        throw err;
+      fs.writeFileSync(tmp, String(process.pid));
+      try { fs.linkSync(tmp, lockPath); return true; }
+      catch (e) {
+        if (e.code === 'EEXIST') return false;
+        const fd = fs.openSync(lockPath, 'wx'); // no hard links here
+        try { fs.writeSync(fd, String(process.pid)); }
+        catch (we) { fs.closeSync(fd); try { fs.unlinkSync(lockPath); } catch {} throw we; }
+        fs.closeSync(fd);
+        return true;
       }
-      try { fs.unlinkSync(lockPath); } catch {} // stale: owner is gone
+    } finally { try { fs.unlinkSync(tmp); } catch {} }
+  };
+  for (let attempt = 0; attempt < 5; attempt++) {
+    let made;
+    try { made = create(); }
+    catch (e) {
+      if (e.code === 'EEXIST') made = false;
+      else { warn(`cannot create output lock (${e.code || e.message}): continuing without one`); return null; }
     }
+    if (made) { heldLocks.add(lockPath); return release; }
+    let pid = NaN;
+    try { pid = parseInt(fs.readFileSync(lockPath, 'utf8'), 10); } catch (re) { if (re.code === 'ENOENT') continue; }
+    if (pidAlive(pid) && pid !== process.pid) {
+      const err = new Error(`another agent-dla (pid ${pid}) is already writing "${path.basename(outPath)}" (if not, delete ${lockPath})`);
+      err.fatal = true;
+      throw err;
+    }
+    // Stale (owner gone, or unreadable). Take it over atomically: move it
+    // aside, then confirm what we moved is the stale lock we judged, not a
+    // live lock a racing process created in between.
+    const aside = `${lockPath}.stale.${process.pid}.${Date.now()}`;
+    try { fs.renameSync(lockPath, aside); } catch { continue; }
+    let moved = NaN;
+    try { moved = parseInt(fs.readFileSync(aside, 'utf8'), 10); } catch {}
+    if (moved === pid || !pidAlive(moved)) { try { fs.unlinkSync(aside); } catch {} continue; }
+    // We displaced a live lock: put it back and refuse.
+    try { fs.linkSync(aside, lockPath); } catch {}
+    try { fs.unlinkSync(aside); } catch {}
+    const err = new Error(`another agent-dla (pid ${moved}) is already writing "${path.basename(outPath)}" (if not, delete ${lockPath})`);
+    err.fatal = true;
+    throw err;
   }
   return null;
 }
@@ -777,6 +813,9 @@ async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0, side
     if (sc && sc.key === sideKey && fs.existsSync(partialPath)) {
       start = fs.statSync(partialPath).size;
       if (totalSize && start > totalSize) { truncate(); start = 0; }
+      // Unknown total size: a resumed 206 cannot be checked for completeness
+      // (nothing to compare the final length to), so start over.
+      else if (!totalSize) { truncate(); start = 0; }
     } else truncate();
   }
   if (totalSize && start === totalSize) return 'ok'; // crashed between rename and receipt: caller verifies
@@ -1188,6 +1227,9 @@ async function runDownloadInner(targetUrl, retryOpts = {}) {
   for (const f of [proxySource, opts.config, opts.list]) {
     if (f) PROTECTED_NAMES.add(path.basename(String(f)).toLowerCase());
   }
+  if (!opts.output && /.(partial|manifest.json|single.json|receipt.json|lock)$/i.test(path.basename(outPath))) {
+    guardFail(`refusing: server filename "${path.basename(outPath)}" looks like a tool staging file (use -o to choose a name)`);
+  }
   if (!opts.output && PROTECTED_NAMES.has(path.basename(outPath).toLowerCase())) {
     guardFail(`refusing: server filename "${path.basename(outPath)}" collides with a tool file (use -o to choose a name)`);
   }
@@ -1366,6 +1408,7 @@ async function runDownloadInner(targetUrl, retryOpts = {}) {
         // Reset only on meaningful progress since the last reset: a server
         // trickling a few bytes per attempt must still exhaust --max-retries.
         const grew = partialSize();
+        if (grew < lastFailPartial) lastFailPartial = 0; // partial was discarded/truncated: measure from the new file
         if (grew - lastFailPartial >= Math.max(64 * 1024, Math.floor((info.size || 0) / 100))) { singleFails = 0; lastFailPartial = grew; }
         singleFails++;
         checkDeadline();
@@ -1585,12 +1628,14 @@ async function runDownloadInner(targetUrl, retryOpts = {}) {
       if (bytesSinceRefresh > 0) signedRefreshes = 0;
       bytesSinceRefresh = 0;
     }
+    // A refresh already in flight is joined before the cap is consulted: the
+    // cap decides whether to START another one, not whether to wait for one.
+    if (refreshingSigned) { await refreshingSigned.catch(() => {}); return job.src === primaryUrl; }
     if (signedRefreshes >= MAX_REFRESHES_WITHOUT_PROGRESS) {
       const e = new Error('signed link refresh failed repeatedly, aborting');
       e.fatal = true;
       throw e;
     }
-    if (refreshingSigned) { await refreshingSigned.catch(() => {}); return job.src === primaryUrl; }
     refreshingSigned = (async () => {
       signedRefreshes++;
       const fresh = await reprobeSigned(originalTarget, info, refreshState);
@@ -1639,8 +1684,12 @@ async function runDownloadInner(targetUrl, retryOpts = {}) {
         emit({ event: 'chunk-done', chunk: job.i, bytes: okBytes, resumed: false, via: job.lastVia || 'direct' });
       }
     };
+    let justRefreshed = false;
     for (let a = 0; a < ATTEMPTS; a++) {
-      if (a > 0) await sleep(300); // don't hammer back-to-back
+      // Don't hammer back-to-back, except right after a refresh: the fresh
+      // link may be short-lived, so use it at once.
+      if (a > 0 && !justRefreshed) await sleep(300);
+      justRefreshed = false;
       try { checkDeadline(); } catch (e) { return { fatal: e }; }
       const proxy = pickProxy();
       const src = pickSrc(job);
@@ -1686,7 +1735,7 @@ async function runDownloadInner(targetUrl, retryOpts = {}) {
           }
           if ((status === 401 || status === 403 || status === 410) && src === primaryUrl && primaryUrl !== originalTarget) {
             try {
-              if (await refreshSignedUrl(job)) continue;
+              if (await refreshSignedUrl(job)) { justRefreshed = true; continue; }
             } catch (re) {
               if (re && re.code === 'CHANGED') return { fresh: true };
               return { fatal: re }; // definitive (revoked/cap): abort, don't requeue
@@ -1706,7 +1755,7 @@ async function runDownloadInner(targetUrl, retryOpts = {}) {
         if (e.code === 'STALE_RANGE') return { stale: true }; // range ignored: single-stream fallback
         if ((status === 401 || status === 403 || status === 410) && primaryUrl !== originalTarget) {
           try {
-            if (await refreshSignedUrl(job)) continue; // retry now with the fresh link, no backoff
+            if (await refreshSignedUrl(job)) { justRefreshed = true; continue; } // retry now with the fresh link, no backoff
           } catch (re) {
             if (re && re.code === 'CHANGED') return { fresh: true };
             return { fatal: re }; // definitive (revoked/cap): abort, don't requeue
