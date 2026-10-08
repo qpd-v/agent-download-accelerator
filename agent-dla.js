@@ -166,24 +166,31 @@ function pidAlive(pid) {
 function acquireOutputLock(outPath) {
   const lockPath = path.resolve(outPath) + '.partial.lock';
   if (heldLocks.has(lockPath)) return null; // same process re-entering (fresh/stale restart)
-  const release = () => {
-    heldLocks.delete(lockPath);
-    // Remove only a lock that still names this process (never a successor's).
-    try { if (parseInt(fs.readFileSync(lockPath, 'utf8'), 10) === process.pid) fs.unlinkSync(lockPath); } catch {}
-  };
+  const breaker = lockPath + '.break';
+  const myPid = String(process.pid);
+  // Remove a file only if it still names this process (never a successor's).
+  const unlinkIfMine = (p) => { try { if (fs.readFileSync(p, 'utf8').trim() === myPid) fs.unlinkSync(p); } catch {} };
+  const release = () => { heldLocks.delete(lockPath); unlinkIfMine(lockPath); };
+  // Windows reports a file that is mid-deletion by another process as EPERM
+  // (also EACCES/EBUSY): that is contention, never a reason to run unlocked.
+  const contended = (e) => e && (e.code === 'EEXIST' || e.code === 'EPERM' || e.code === 'EACCES' || e.code === 'EBUSY');
   // The lock must never be visible empty: write the pid to a private temp file
   // and hard-link it into place (atomic; EEXIST if held). Filesystems without
-  // hard links fall back to O_EXCL create + write.
-  const tmp = `${lockPath}.${process.pid}.${Date.now()}.tmp`;
+  // hard links fall back to O_EXCL create + write. Returns true (made), false
+  // (held/contended); throws {failOpen} only when the directory itself can't be written.
+  const tmp = lockPath + '.' + process.pid + '.' + Date.now() + '.tmp';
+  const failOpen = (e) => { e.failOpen = true; return e; };
   const create = () => {
+    try { fs.writeFileSync(tmp, myPid); } catch (e) { throw failOpen(e); }
     try {
-      fs.writeFileSync(tmp, String(process.pid));
       try { fs.linkSync(tmp, lockPath); return true; }
       catch (e) {
-        if (e.code === 'EEXIST') return false;
-        const fd = fs.openSync(lockPath, 'wx'); // no hard links here
-        try { fs.writeSync(fd, String(process.pid)); }
-        catch (we) { fs.closeSync(fd); try { fs.unlinkSync(lockPath); } catch {} throw we; }
+        if (contended(e)) return false;
+        let fd;
+        try { fd = fs.openSync(lockPath, 'wx'); } // no hard links on this filesystem
+        catch (oe) { if (contended(oe)) return false; throw failOpen(oe); }
+        try { fs.writeSync(fd, myPid); }
+        catch (we) { fs.closeSync(fd); try { fs.unlinkSync(lockPath); } catch {} throw failOpen(we); }
         fs.closeSync(fd);
         return true;
       }
@@ -191,46 +198,47 @@ function acquireOutputLock(outPath) {
   };
   const sleepMs = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch {} };
   const busy = (pid) => {
-    const err = new Error(`another agent-dla (pid ${pid}) is already writing "${path.basename(outPath)}" (if not, delete ${lockPath})`);
+    const err = new Error('another agent-dla (pid ' + pid + ') is already writing "' + path.basename(outPath) + '" (if not, delete ' + lockPath + (pid === 'unknown' ? ' and ' + breaker : '') + ')');
     err.fatal = true;
     return err;
   };
   const readPid = () => { try { return parseInt(fs.readFileSync(lockPath, 'utf8'), 10); } catch (re) { return re.code === 'ENOENT' ? null : NaN; } };
-  const breaker = lockPath + '.break';
+  const tryCreate = () => { // true = made, false = held; null = cannot lock here (fail open)
+    try { return create(); }
+    catch (e) { if (e.failOpen) { warn('cannot create output lock (' + (e.code || e.message) + '): continuing without one'); return null; } throw e; }
+  };
+  const take = () => { heldLocks.add(lockPath); return release; };
   for (let attempt = 0; attempt < 8; attempt++) {
-    let made;
-    try { made = create(); }
-    catch (e) {
-      if (e.code === 'EEXIST') made = false;
-      else { warn(`cannot create output lock (${e.code || e.message}): continuing without one`); return null; }
-    }
-    if (made) { heldLocks.add(lockPath); return release; }
+    const made = tryCreate();
+    if (made === null) return null;
+    if (made) return take();
     const pid = readPid();
     if (pid === null) continue; // vanished: try to create again
     if (pidAlive(pid) && pid !== process.pid) throw busy(pid);
     // Stale (owner gone, or unreadable). Only one process at a time may remove
-    // a lock it judged stale: take the break file (O_EXCL), re-check the lock
-    // under it, unlink, and create our own before letting anyone else break.
+    // a lock it judged stale: take the break file (O_EXCL, holding our pid),
+    // re-check the lock under it, unlink, and create our own before releasing.
     let bfd = null;
     try { bfd = fs.openSync(breaker, 'wx'); }
     catch (e) {
-      if (e.code === 'EEXIST') {
-        try { if (Date.now() - fs.statSync(breaker).mtimeMs > 10000) fs.unlinkSync(breaker); } catch {} // abandoned breaker
-        sleepMs(20 + Math.floor(Math.random() * 30));
-        continue;
-      }
-      warn(`cannot create output lock (${e.code || e.message}): continuing without one`);
-      return null;
+      if (!contended(e)) { warn('cannot create output lock (' + (e.code || e.message) + '): continuing without one'); return null; }
+      try { // clear a break file only when its owner is gone and it is old
+        const st = fs.statSync(breaker);
+        const owner = parseInt(fs.readFileSync(breaker, 'utf8'), 10);
+        if (Date.now() - st.mtimeMs > 10000 && !(pidAlive(owner) && owner !== process.pid)) fs.unlinkSync(breaker);
+      } catch {}
+      sleepMs(20 + Math.floor(Math.random() * 30));
+      continue;
     }
     try {
-      fs.closeSync(bfd);
+      try { fs.writeSync(bfd, myPid); } catch {} finally { fs.closeSync(bfd); }
       const again = readPid();
       if (again !== null && pidAlive(again) && again !== process.pid) throw busy(again); // someone else took it first
       if (again !== null) { try { fs.unlinkSync(lockPath); } catch {} }
-      let made2 = false;
-      try { made2 = create(); } catch (e) { if (e.code !== 'EEXIST') { warn(`cannot create output lock (${e.code || e.message}): continuing without one`); return null; } }
-      if (made2) { heldLocks.add(lockPath); return release; }
-    } finally { try { fs.unlinkSync(breaker); } catch {} }
+      const made2 = tryCreate();
+      if (made2 === null) return null;
+      if (made2) return take();
+    } finally { unlinkIfMine(breaker); }
   }
   // Heavy contention on the same output: refuse rather than risk sharing it.
   throw busy('unknown');

@@ -1705,6 +1705,34 @@ describe('reliability', () => {
       assert.ok(typeof rel === 'function', `junk lock "${junk}" taken over`);
       rel();
     }
+    // 5b. Windows reports a file another process is mid-deleting as EPERM:
+    // that is contention and must be retried, never "continue unlocked".
+    fs.writeFileSync(lockPath, '999'); // stale
+    let eperms = 0;
+    const eperm = () => { eperms++; const e = new Error('EPERM'); e.code = 'EPERM'; return e; };
+    const P1 = lockHarness(777, alive, { before: (k, args) => { if (k === 'openSync' && /.break$/.test(String(args[0])) && eperms < 2) throw eperm(); } });
+    const relP1 = P1.acquireOutputLock(out);
+    assert.ok(typeof relP1 === 'function', 'EPERM on the break file is retried, not fail-open');
+    assert.ok(eperms >= 1, 'EPERM was actually injected');
+    assert.equal(fs.readFileSync(lockPath, 'utf8'), '777');
+    relP1();
+    eperms = 0;
+    const P2 = lockHarness(778, alive, { before: (k, args) => { if (k === 'linkSync' && String(args[1]) === lockPath && eperms < 2) throw eperm(); } });
+    const relP2 = P2.acquireOutputLock(out);
+    assert.ok(typeof relP2 === 'function', 'EPERM linking the lock is retried, not fail-open');
+    relP2();
+    // a break file whose owner is alive blocks a takeover even when old; a dead owner's is cleared
+    fs.writeFileSync(lockPath, '999');
+    fs.writeFileSync(lockPath + '.break', '111'); // 111 is alive in this harness
+    fs.utimesSync(lockPath + '.break', new Date(Date.now() - 60000), new Date(Date.now() - 60000));
+    assert.throws(() => lockHarness(779, alive).acquireOutputLock(out), /already writing/, 'live breaker is respected');
+    alive.delete(111);
+    const relP3 = lockHarness(779, alive).acquireOutputLock(out);
+    assert.ok(typeof relP3 === 'function', 'abandoned break file (dead owner) is cleared');
+    relP3();
+    assert.deepEqual(fs.readdirSync(work).filter((f) => /.(tmp|stale|break)/.test(f)), [], 'no leftovers');
+    alive.add(111);
+
     const W = lockHarness(666, alive, { before: (k, args) => { if (k === 'writeFileSync' && /.tmp$/.test(String(args[0]))) { const e = new Error('no space'); e.code = 'ENOSPC'; throw e; } } });
     assert.equal(W.acquireOutputLock(out), null, 'cannot create a lock: continue unlocked');
     assert.ok(W.warnings.some((m) => /cannot create output lock/.test(m)), 'and say so');
