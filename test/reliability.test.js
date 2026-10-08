@@ -1622,7 +1622,7 @@ describe('reliability', () => {
   function lockHarness(pid, alive, fsHooks = {}) {
     const src = fs.readFileSync(H.AGENT_DLA, 'utf8');
     const from = src.indexOf('const heldLocks = new Set();');
-    const to = src.indexOf("process.on('exit', () => { for (const l of heldLocks)");
+    const to = src.indexOf("process.on('exit', () => {");
     assert.ok(from > 0 && to > from, 'lock block located');
     const fakeProcess = { pid, kill: (p) => { if (alive.has(p)) return true; const e = new Error('ESRCH'); e.code = 'ESRCH'; throw e; } };
     const hooked = new Proxy(fs, { get(t, k) { const f = t[k]; return typeof f === 'function' ? (...args) => { if (fsHooks.before) fsHooks.before(k, args); return f.apply(t, args); } : f; } });
@@ -1656,22 +1656,47 @@ describe('reliability', () => {
     assert.equal(fs.readFileSync(lockPath, 'utf8'), '222', "A's release must not delete B's live lock");
     fs.unlinkSync(lockPath);
 
-    // 4. Takeover race: stale lock (pid 999 dead). Just as C moves it aside,
-    // D completes a full takeover and holds a live lock; C must not displace D.
+    // 4. Takeover race: stale lock (pid 999 dead). Just as C is about to take
+    // the break file, D completes a full takeover and holds a live lock. C must
+    // re-check under the break file and refuse, never delete D's lock.
     fs.writeFileSync(lockPath, '999');
     alive.add(333).add(444);
     let D = null;
     const Dh = lockHarness(444, alive);
     let injected = false;
     const C = lockHarness(333, alive, {
-      before: (k) => { if (k === 'renameSync' && !injected) { injected = true; D = Dh.acquireOutputLock(out); } },
+      before: (k, args) => { if (k === 'openSync' && /.break$/.test(String(args[0])) && !injected) { injected = true; D = Dh.acquireOutputLock(out); } },
     });
     assert.throws(() => C.acquireOutputLock(out), /already writing/, 'C must refuse: D took the stale lock first');
     assert.ok(typeof D === 'function', 'D holds the lock');
     assert.equal(fs.readFileSync(lockPath, 'utf8'), '444', "D's live lock intact");
     D();
     assert.ok(!fs.existsSync(lockPath));
-    assert.deepEqual(fs.readdirSync(work).filter((f) => /.(tmp|stale)/.test(f)), [], 'no temp/stale leftovers');
+    assert.deepEqual(fs.readdirSync(work).filter((f) => /.(tmp|stale|break)/.test(f)), [], 'no temp/break leftovers');
+
+    // 4b. Third process while a takeover is in progress: it must not slip in
+    // between the takeover's unlink and create (the double-hold from the review).
+    fs.writeFileSync(lockPath, '999');
+    alive.add(555).add(666);
+    let E = null, eErr = null, injected2 = false;
+    const Eh = lockHarness(666, alive);
+    const Fh = lockHarness(555, alive, {
+      before: (k, args) => {
+        // F has the break file and is about to unlink the stale lock: E arrives now.
+        if (k === 'unlinkSync' && String(args[0]) === lockPath && !injected2) {
+          injected2 = true;
+          try { E = Eh.acquireOutputLock(out); } catch (e) { eErr = e; }
+        }
+      },
+    });
+    const relF = Fh.acquireOutputLock(out);
+    assert.ok(typeof relF === 'function', 'F (the breaker) ends up holding the lock');
+    assert.equal(E, null, 'E must not hold the lock too');
+    assert.ok(eErr && /already writing/.test(eErr.message), 'E refused while the takeover was in progress');
+    assert.equal(fs.readFileSync(lockPath, 'utf8'), '555');
+    relF();
+    assert.ok(!fs.existsSync(lockPath));
+    assert.deepEqual(fs.readdirSync(work).filter((f) => /.(tmp|stale|break)/.test(f)), [], 'no leftovers');
 
     // 5. Garbage/empty locks are stale; an unwritable directory fails open WITH a warning.
     for (const junk of ['', 'garbage', '0', '-1', '3.7']) {
@@ -1733,9 +1758,44 @@ describe('reliability', () => {
         assert.match(r.stdout + r.stderr, /staging file/);
         assert.ok(!fs.existsSync(path.join(work, name)), `${name} not written`);
       }
+      // Legitimate names that merely resemble staging suffixes must work (no -o).
+      for (const name of ['Cargo.lock', 'impartial', 'deadlock', 'app-manifest.json', 'notes.lock.txt']) {
+        const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/${name}`, '--json'], { cwd: work });
+        assert.equal(r.code, 0, `${name} must download: ${(r.stdout + r.stderr).slice(-200)}`);
+        assert.ok(fs.existsSync(path.join(work, name)), `${name} written`);
+      }
       // An explicit -o is the user's choice and still works.
       const r2 = await H.runAccel([`http://127.0.0.1:${s.address().port}/item.partial`, '-o', path.join(work, 'ok.bin'), '--json'], { cwd: work });
       assert.equal(r2.code, 0);
+    } finally {
+      s.close();
+    }
+  });
+
+  it('a server that ignores Range and keeps dropping cannot reset the retry budget forever', { timeout: 90000 }, async () => {
+    const work = H.workdir('rel-norange-loop');
+    const buf = crypto.randomBytes(6 * MB);
+    let gets = 0; // full restarts from byte 0
+    // Range is ignored: a resume request is answered with a 200 (the client
+    // restarts from zero), and every full transfer dies after 2MB or 1MB,
+    // alternating. The partial shrinks and grows again, so a baseline that is
+    // rebased downward would hand out a fresh retry budget forever.
+    const s = require('http').createServer((q, res) => {
+      res.writeHead(200, { 'Content-Length': buf.length });
+      if (/bytes=0-0/.test(q.headers.range || '')) { res.end(buf); return; } // probe: whole body
+      if (q.headers.range) { res.write(buf.subarray(0, 1024)); return; } // resume attempt: client sees 200 and restarts
+      gets++;
+      res.write(buf.subarray(0, gets % 2 ? 2 * MB : 1 * MB));
+      setTimeout(() => { try { q.socket.destroy(); } catch {} }, 100);
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    try {
+      const t0 = Date.now();
+      const r = await H.runAccel([`http://127.0.0.1:${s.address().port}/f.bin`, '-o', path.join(work, 'o.bin'), '-n', '1', '--max-retries', '3', '--json'], { cwd: work, timeoutMs: 80000 });
+      assert.equal(r.code, 1, 'must give up, not loop');
+      assert.match(r.stdout + r.stderr, /single-stream failed 3x/);
+      assert.ok(gets <= 8, `bounded attempts (saw ${gets})`);
+      assert.ok(Date.now() - t0 < 60000, 'bounded time');
     } finally {
       s.close();
     }

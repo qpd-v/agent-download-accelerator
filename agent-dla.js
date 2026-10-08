@@ -189,7 +189,15 @@ function acquireOutputLock(outPath) {
       }
     } finally { try { fs.unlinkSync(tmp); } catch {} }
   };
-  for (let attempt = 0; attempt < 5; attempt++) {
+  const sleepMs = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch {} };
+  const busy = (pid) => {
+    const err = new Error(`another agent-dla (pid ${pid}) is already writing "${path.basename(outPath)}" (if not, delete ${lockPath})`);
+    err.fatal = true;
+    return err;
+  };
+  const readPid = () => { try { return parseInt(fs.readFileSync(lockPath, 'utf8'), 10); } catch (re) { return re.code === 'ENOENT' ? null : NaN; } };
+  const breaker = lockPath + '.break';
+  for (let attempt = 0; attempt < 8; attempt++) {
     let made;
     try { made = create(); }
     catch (e) {
@@ -197,31 +205,41 @@ function acquireOutputLock(outPath) {
       else { warn(`cannot create output lock (${e.code || e.message}): continuing without one`); return null; }
     }
     if (made) { heldLocks.add(lockPath); return release; }
-    let pid = NaN;
-    try { pid = parseInt(fs.readFileSync(lockPath, 'utf8'), 10); } catch (re) { if (re.code === 'ENOENT') continue; }
-    if (pidAlive(pid) && pid !== process.pid) {
-      const err = new Error(`another agent-dla (pid ${pid}) is already writing "${path.basename(outPath)}" (if not, delete ${lockPath})`);
-      err.fatal = true;
-      throw err;
+    const pid = readPid();
+    if (pid === null) continue; // vanished: try to create again
+    if (pidAlive(pid) && pid !== process.pid) throw busy(pid);
+    // Stale (owner gone, or unreadable). Only one process at a time may remove
+    // a lock it judged stale: take the break file (O_EXCL), re-check the lock
+    // under it, unlink, and create our own before letting anyone else break.
+    let bfd = null;
+    try { bfd = fs.openSync(breaker, 'wx'); }
+    catch (e) {
+      if (e.code === 'EEXIST') {
+        try { if (Date.now() - fs.statSync(breaker).mtimeMs > 10000) fs.unlinkSync(breaker); } catch {} // abandoned breaker
+        sleepMs(20 + Math.floor(Math.random() * 30));
+        continue;
+      }
+      warn(`cannot create output lock (${e.code || e.message}): continuing without one`);
+      return null;
     }
-    // Stale (owner gone, or unreadable). Take it over atomically: move it
-    // aside, then confirm what we moved is the stale lock we judged, not a
-    // live lock a racing process created in between.
-    const aside = `${lockPath}.stale.${process.pid}.${Date.now()}`;
-    try { fs.renameSync(lockPath, aside); } catch { continue; }
-    let moved = NaN;
-    try { moved = parseInt(fs.readFileSync(aside, 'utf8'), 10); } catch {}
-    if (moved === pid || !pidAlive(moved)) { try { fs.unlinkSync(aside); } catch {} continue; }
-    // We displaced a live lock: put it back and refuse.
-    try { fs.linkSync(aside, lockPath); } catch {}
-    try { fs.unlinkSync(aside); } catch {}
-    const err = new Error(`another agent-dla (pid ${moved}) is already writing "${path.basename(outPath)}" (if not, delete ${lockPath})`);
-    err.fatal = true;
-    throw err;
+    try {
+      fs.closeSync(bfd);
+      const again = readPid();
+      if (again !== null && pidAlive(again) && again !== process.pid) throw busy(again); // someone else took it first
+      if (again !== null) { try { fs.unlinkSync(lockPath); } catch {} }
+      let made2 = false;
+      try { made2 = create(); } catch (e) { if (e.code !== 'EEXIST') { warn(`cannot create output lock (${e.code || e.message}): continuing without one`); return null; } }
+      if (made2) { heldLocks.add(lockPath); return release; }
+    } finally { try { fs.unlinkSync(breaker); } catch {} }
   }
-  return null;
+  // Heavy contention on the same output: refuse rather than risk sharing it.
+  throw busy('unknown');
 }
-process.on('exit', () => { for (const l of heldLocks) { try { fs.unlinkSync(l); } catch {} } });
+process.on('exit', () => {
+  for (const l of heldLocks) {
+    try { if (parseInt(fs.readFileSync(l, 'utf8'), 10) === process.pid) fs.unlinkSync(l); } catch {}
+  }
+});
 const CUSTOM_HEADERS = {};
 for (const h of (opts.header || [])) {
   const i = String(h).indexOf(':');
@@ -795,7 +813,7 @@ function downloadRange(url, start, end, fd, proxyUrl, onProgress, token, depth =
     req.end();
   });
 }
-async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0, sideKey = null, validators = null) {
+async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0, sideKey = null, validators = null, state = null) {
   const u = new URL(url);
   const isHttps = u.protocol === 'https:';
   const lib = isHttps ? https : http;
@@ -818,6 +836,7 @@ async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0, side
       else if (!totalSize) { truncate(); start = 0; }
     } else truncate();
   }
+  if (state && state.firstStart === undefined) state.firstStart = start; // where the first attempt really began (after any discard)
   if (totalSize && start === totalSize) return 'ok'; // crashed between rename and receipt: caller verifies
   if (start > 0) { say(`Resuming single-stream at ${(start / 1048576).toFixed(1)} MB`); if (!validators) warnNoValidator(); }
   else writeSidecar();
@@ -845,7 +864,7 @@ async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0, side
         catch (e) { res.resume(); reject(e); return; }
         if (next) {
           res.resume();
-          downloadSingle(next, outPath, proxyUrl, totalSize, depth + 1, sideKey, validators).then(() => resolve('ok'), reject);
+          downloadSingle(next, outPath, proxyUrl, totalSize, depth + 1, sideKey, validators, state).then(() => resolve('ok'), reject);
           return;
         }
         if (start > 0 && res.statusCode === 412) {
@@ -1227,7 +1246,7 @@ async function runDownloadInner(targetUrl, retryOpts = {}) {
   for (const f of [proxySource, opts.config, opts.list]) {
     if (f) PROTECTED_NAMES.add(path.basename(String(f)).toLowerCase());
   }
-  if (!opts.output && /.(partial|manifest.json|single.json|receipt.json|lock)$/i.test(path.basename(outPath))) {
+  if (!opts.output && /\.(partial|manifest\.json|single\.json|receipt\.json|partial\.lock)$/i.test(path.basename(outPath))) {
     guardFail(`refusing: server filename "${path.basename(outPath)}" looks like a tool staging file (use -o to choose a name)`);
   }
   if (!opts.output && PROTECTED_NAMES.has(path.basename(outPath).toLowerCase())) {
@@ -1346,7 +1365,11 @@ async function runDownloadInner(targetUrl, retryOpts = {}) {
     const singleSidecar = outPath + '.single.json';
     shutdownHandler = (sig) => { emit({ event: 'interrupted', signal: sig, output: outPath }); console.error(`\nInterrupted (${sig}). Partial kept at ${singlePartial} — rerun to resume.`); process.exit(sig === 'SIGTERM' ? 143 : 130); };
     let singleFails = 0;
-    let lastFailPartial = 0; // .partial size at the last retry-count reset (set below)
+    // Retry budget: reset only when the .partial grows past its high-water mark
+    // by a meaningful amount. A server that ignores Range restarts from 0 on
+    // every attempt, so its partial never gets past the mark and retries run out.
+    let highWater = null;
+    const singleState = {};
     const singleValidators = (info.etag && !/^W\//i.test(info.etag)) ? { etag: info.etag, mtime: null }
       : (info.mtime ? { etag: null, mtime: info.mtime } : null);
     // Signed-link refresh for single-stream (R2): same rules as the chunked
@@ -1359,11 +1382,10 @@ async function runDownloadInner(targetUrl, retryOpts = {}) {
     let partialAtRefresh = -1;
     const singleRefreshState = { rateWaited: false };
     const partialSize = () => { try { return fs.statSync(singlePartial).size; } catch { return 0; } };
-    lastFailPartial = partialSize();
     while (true) {
       checkDeadline();
       try {
-        await downloadSingle(singleUrl, outPath, nextProxy(), info.size, 0, fileKey, singleValidators);
+        await downloadSingle(singleUrl, outPath, nextProxy(), info.size, 0, fileKey, singleValidators, singleState);
         break;
       } catch (e) {
         const cls = classifyErr(e);
@@ -1408,8 +1430,8 @@ async function runDownloadInner(targetUrl, retryOpts = {}) {
         // Reset only on meaningful progress since the last reset: a server
         // trickling a few bytes per attempt must still exhaust --max-retries.
         const grew = partialSize();
-        if (grew < lastFailPartial) lastFailPartial = 0; // partial was discarded/truncated: measure from the new file
-        if (grew - lastFailPartial >= Math.max(64 * 1024, Math.floor((info.size || 0) / 100))) { singleFails = 0; lastFailPartial = grew; }
+        if (highWater === null) highWater = singleState.firstStart || 0;
+        if (grew - highWater >= Math.max(64 * 1024, Math.floor((info.size || 0) / 100))) { singleFails = 0; highWater = grew; }
         singleFails++;
         checkDeadline();
         if (singleFails > MAX_RETRIES) {

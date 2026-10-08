@@ -118,7 +118,7 @@ strings, and fragments; `--redact` extends that to human logs.
   content per account (userinfo, `--header "Authorization: ..."`, cookies),
   use a distinct `-o` name per account so receipts and partials are not shared.
   Server-chosen names ending in `.partial`, `.manifest.json`, `.single.json`,
-  `.receipt.json` or `.lock` are refused (use `-o`).
+  `.receipt.json` or `.partial.lock` are refused (use `-o`).
   If the server sends neither ETag nor Last-Modified, a same-size republish
   during a resume cannot be detected; the tool warns once when resuming in
   that case. Pass `--sha256` to verify the result.
