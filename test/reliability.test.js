@@ -1464,6 +1464,46 @@ describe('reliability', () => {
     }
   });
 
+  it('resuming without any validator warns to use --sha256 (once, silent with ETag)', { timeout: 120000 }, async () => {
+    for (const withEtag of [false, true]) {
+      const work = H.workdir(`rel-novalidator-${withEtag}`);
+      const buf = crypto.randomBytes(6 * MB);
+      const s = require('http').createServer((q, res) => {
+        const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+        const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : buf.length - 1;
+        res.writeHead(m ? 206 : 200, { ...(withEtag ? { ETag: '"v1"' } : {}), 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${buf.length}` } : {}) });
+        let off = a;
+        const tick = () => {
+          if (res.destroyed) return;
+          const n = Math.min(64 * 1024, b - off + 1);
+          res.write(buf.subarray(off, off + n));
+          off += n;
+          if (off > b) res.end(); else setTimeout(tick, 100);
+        };
+        tick();
+      });
+      await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+      try {
+        const url = `http://127.0.0.1:${s.address().port}/f.bin`;
+        const out = path.join(work, 'o.bin');
+        for (const n of ['1', '4']) {
+          const c = spawn('node', [H.AGENT_DLA, url, '-o', out, '-n', n], { cwd: work });
+          const closed = new Promise((r) => c.on('close', r));
+          await H.sleep(1500);
+          c.kill();
+          await closed;
+          const r = await H.runAccel([url, '-o', out, '-n', n, '--json'], { cwd: work });
+          assert.equal(r.code, 0);
+          assert.equal(/no ETag or Last-Modified/.test(r.stderr), !withEtag, `warning iff no validators (etag=${withEtag}, -n ${n})`);
+          fs.rmSync(out, { force: true });
+          fs.rmSync(path.join(work, '.agent-dla'), { recursive: true, force: true });
+        }
+      } finally {
+        s.close();
+      }
+    }
+  });
+
   it('single-stream trickle (bytes per attempt) still exhausts --max-retries', { timeout: 60000 }, async () => {
     const work = H.workdir('rel-single-trickle');
     const buf = crypto.randomBytes(1 * MB);

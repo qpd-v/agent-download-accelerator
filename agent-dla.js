@@ -150,6 +150,14 @@ const usedOutputs = new Set(); // outputs claimed by this process (batch uniquen
 // with O_EXCL. A lock whose pid is gone is stale (crash/kill) and is taken over.
 // A reused pid looks alive: the error names the lock file so a human can clear it.
 const heldLocks = new Set();
+// Resuming without ETag/Last-Modified cannot prove the file is unchanged: a
+// same-size republish would mix versions. Only a checksum catches that.
+let warnedNoValidator = false;
+function warnNoValidator() {
+  if (warnedNoValidator || EXPECT_SHA) return;
+  warnedNoValidator = true;
+  warn('resuming from a server that sends no ETag or Last-Modified: a republished file of the same size cannot be detected. Use --sha256 to verify the result.');
+}
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (e) { return !!(e && e.code === 'EPERM'); }
@@ -772,7 +780,7 @@ async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0, side
     } else truncate();
   }
   if (totalSize && start === totalSize) return 'ok'; // crashed between rename and receipt: caller verifies
-  if (start > 0) say(`Resuming single-stream at ${(start / 1048576).toFixed(1)} MB`);
+  if (start > 0) { say(`Resuming single-stream at ${(start / 1048576).toFixed(1)} MB`); if (!validators) warnNoValidator(); }
   else writeSidecar();
   let restarts = 0;
   for (;;) {
@@ -1410,6 +1418,7 @@ async function runDownloadInner(targetUrl, retryOpts = {}) {
       && partialStat && partialStat.size === size) {
       doneIv = mergeIv([...m.done, ...Object.values(m.active || {}).filter((a) => Array.isArray(a) && a[1] > a[0]).map(([s, c]) => [s, c - 1]).filter(validIv)]);
       say(`Resuming from manifest (${doneIv.reduce((t, [s, e]) => t + (e - s + 1), 0)} of ${size} bytes kept).`);
+      if (!info.etag && !info.mtime) warnNoValidator();
     } else {
       try { fs.unlinkSync(partialPath); } catch {}
       try { fs.unlinkSync(manifestPath); } catch {}

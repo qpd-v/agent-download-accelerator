@@ -111,6 +111,9 @@ strings, and fragments; `--redact` extends that to human logs.
   while a refreshed presigned URL resumes the same file with or without an
   ETag.
   A republished file (validator change) restarts clean instead of mixing versions.
+  If the server sends neither ETag nor Last-Modified, a same-size republish
+  during a resume cannot be detected; the tool warns once when resuming in
+  that case. Pass `--sha256` to verify the result.
 - Each mirror must byte-match first- and last-1KB samples of the primary
   before serving chunks; mismatches are evicted (warns without `--sha256`).
 - `--list` lines must be valid http(s) URLs or they are skipped without retries.
