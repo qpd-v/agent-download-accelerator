@@ -29,7 +29,7 @@
   },
   "type": "commonjs",
   "bin": {
-    "agent-dla": "./agent-dla.js"
+    "agent-dla": "agent-dla.js"
   },
   "files": [
     "agent-dla.js",
