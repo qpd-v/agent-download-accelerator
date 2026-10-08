@@ -13,6 +13,9 @@ JavaScript, no native dependencies. Requires Node >= 22.
 npm install -g agent-download-accelerator
 ```
 
+The package is `agent-download-accelerator`; the command it installs is `agent-dla`.
+One-off, without installing: `npx --package agent-download-accelerator agent-dla <url>`.
+
 Or from source:
 
 ```
