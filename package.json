@@ -1,7 +1,20 @@
 {
-  "name": "agent-download-accelerator",
+  "name": "agent-dla",
   "version": "1.0.0",
   "description": "Agent Download Accelerator: parallel Range chunks, mirrors, proxy rotation, resume",
+  "keywords": [
+    "download",
+    "downloader",
+    "accelerator",
+    "parallel",
+    "range",
+    "resume",
+    "proxy",
+    "mirror",
+    "cli",
+    "agent",
+    "ai-agent"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
