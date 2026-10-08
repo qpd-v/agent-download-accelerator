@@ -185,7 +185,11 @@ function acquireOutputLock(outPath) {
     try {
       try { fs.linkSync(tmp, lockPath); return true; }
       catch (e) {
-        if (contended(e)) return false;
+        // Only EEXIST means "held". Anything else, EPERM included (link(2)
+        // reports it on filesystems without hard links: vfat, exFAT, some
+        // FUSE/SMB mounts), falls back to O_EXCL, whose own errors then
+        // classify as contention or fail-open.
+        if (e.code === 'EEXIST') return false;
         let fd;
         try { fd = fs.openSync(lockPath, 'wx'); } // no hard links on this filesystem
         catch (oe) { if (contended(oe)) return false; throw failOpen(oe); }

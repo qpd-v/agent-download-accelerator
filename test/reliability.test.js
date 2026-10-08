@@ -1721,6 +1721,17 @@ describe('reliability', () => {
     const relP2 = P2.acquireOutputLock(out);
     assert.ok(typeof relP2 === 'function', 'EPERM linking the lock is retried, not fail-open');
     relP2();
+    // 5c. Filesystems without hard links (vfat/exFAT/FUSE): link(2) fails with
+    // EPERM for everything. The O_EXCL fallback must still take the lock.
+    alive.add(780).add(781);
+    const NH = lockHarness(780, alive, { before: (k, args) => { if (k === 'linkSync') throw eperm(); } });
+    const relNH = NH.acquireOutputLock(out);
+    assert.ok(typeof relNH === 'function', 'no hard links: falls back to O_EXCL, not "busy"');
+    assert.equal(fs.readFileSync(lockPath, 'utf8'), '780');
+    assert.deepEqual(NH.warnings, [], 'no warning');
+    assert.throws(() => lockHarness(781, alive, { before: (k) => { if (k === 'linkSync') throw eperm(); } }).acquireOutputLock(out), /already writing/, 'and a held lock still refuses there');
+    relNH();
+    assert.ok(!fs.existsSync(lockPath));
     // a break file whose owner is alive blocks a takeover even when old; a dead owner's is cleared
     fs.writeFileSync(lockPath, '999');
     fs.writeFileSync(lockPath + '.break', '111'); // 111 is alive in this harness
