@@ -8,6 +8,19 @@ const crypto = require('crypto');
 const H = require('./helpers');
 
 const MB = 1048576;
+// Wait until a run has saved real progress (a fixed sleep flakes under load:
+// the first run may not have written its manifest yet when it is killed).
+async function waitForKept(manifestPath) {
+  for (let i = 0; i < 300; i++) {
+    try {
+      const m = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      const kept = (m.done || []).reduce((t, [x, y]) => t + (y - x + 1), 0)
+        + Object.values(m.active || {}).reduce((t, a) => t + (Array.isArray(a) ? Math.max(0, a[1] - a[0]) : 0), 0);
+      if (kept > 0) return;
+    } catch {}
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
 
 describe('reliability', () => {
   it('403 proxy is dropped at benchmark, download completes direct', { timeout: 120000 }, async () => {
@@ -1120,7 +1133,7 @@ describe('reliability', () => {
       const out = path.join(work, 'o.bin');
       const c = spawn('node', [H.AGENT_DLA, `${base}?id=1`, '-o', out, '-n', '4'], { cwd: work });
       const closed = new Promise((r) => c.on('close', r));
-      await H.sleep(2500);
+      await waitForKept(out + '.manifest.json');
       c.kill();
       await closed;
       assert.ok(fs.existsSync(out + '.partial'), 'partial kept after kill');
@@ -1230,7 +1243,7 @@ describe('reliability', () => {
       const out = path.join(work, 'model.bin');
       const c = spawn('node', [H.AGENT_DLA, `${base}A`, '-o', out, '-n', '4'], { cwd: work });
       const closed = new Promise((r) => c.on('close', r));
-      await H.sleep(2500);
+      await waitForKept(out + '.manifest.json');
       c.kill();
       await closed;
       assert.ok(fs.existsSync(out + '.partial'), 'partial kept after kill');
@@ -1334,7 +1347,7 @@ describe('reliability', () => {
       let off = a;
       const tick = () => {
         if (res.destroyed) return;
-        const key = cutAt && cutAt(off, Date.now() - st.t0);
+        const key = cutAt && cutAt(off, Date.now() - st.t0, +u.searchParams.get('exp'));
         if (key !== null && key !== undefined && key !== false && !cut.has(key)) { cut.add(key); q.socket.destroy(); return; }
         const n = Math.min(pace.bytes, b - off + 1);
         res.write(buf.subarray(off, off + n));
@@ -1351,6 +1364,8 @@ describe('reliability', () => {
 
   it('long download over short-lived links refreshes more than 5 times (R1)', { timeout: 180000 }, async () => {
     const work = H.workdir('rel-refresh-many');
+    const cutDone = new Set(); // jobs already cut
+    let lastCut = 0;
     const buf = crypto.randomBytes(6 * MB);
     const hash = crypto.createHash('sha256').update(buf).digest('hex');
     // -n 6 = six 1MB jobs at ~64KB/s. Job k's connection drops once at
@@ -1358,8 +1373,16 @@ describe('reliability', () => {
     // spaced drops = six successful refreshes, each followed by progress.
     const { s } = signedLinkServer(buf, {
       lifeMs: 1000,
-      pace: { bytes: 16 * 1024, ms: 250 },
-      cutAt: (off, el) => { const k = Math.floor(off / MB); return el > 1500 + 2500 * k ? k : null; },
+      pace: { bytes: 8 * 1024, ms: 250 }, // ~32KB/s: each 1MB job lasts ~32s, so all six cuts land mid-download
+      // Cut each job once, halfway through its range, on a link that has already
+      // expired. Cuts are 1.5s apart (a link lives 1s): one refresh serves every
+      // retry inside one link lifetime, so spacing is what forces a refresh per cut.
+      cutAt: (off, el, exp) => {
+        const k = Math.floor(off / MB);
+        if (cutDone.has(k) || off < k * MB + MB / 2 || Date.now() <= exp || Date.now() - lastCut < 1500) return null;
+        cutDone.add(k); lastCut = Date.now();
+        return k;
+      },
     });
     await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
     try {
@@ -1840,6 +1863,68 @@ describe('reliability', () => {
     }
   });
 
+  it('no URL credentials or signed-link secrets reach any file on disk; resume still works', { timeout: 120000 }, async () => {
+    const work = H.workdir('rel-no-secrets-on-disk');
+    const buf = crypto.randomBytes(8 * MB);
+    const hash = crypto.createHash('sha256').update(buf).digest('hex');
+    // Long random-looking secrets: short ones could appear in random fixture bytes by chance.
+    const USER = 'USERSECRET9', PASS = 'PASSSECRET8', SIG1 = 'SIGSECRET7', SIG2 = 'OTHERSIG6', TOK = 'TOKSECRET5';
+    const s = require('http').createServer((q, res) => {
+      const m = /bytes=(\d+)-(\d*)/.exec(q.headers.range || '');
+      const a = m ? +m[1] : 0, b = m && m[2] ? +m[2] : buf.length - 1;
+      res.writeHead(m ? 206 : 200, { 'Content-Length': b - a + 1, ...(m ? { 'Content-Range': `bytes ${a}-${b}/${buf.length}` } : {}) });
+      let off = a;
+      const tick = () => {
+        if (res.destroyed) return;
+        const n = Math.min(64 * 1024, b - off + 1);
+        res.write(buf.subarray(off, off + n));
+        off += n;
+        if (off > b) res.end(); else setTimeout(tick, 100);
+      };
+      tick();
+    });
+    await new Promise((ok) => s.listen(0, '127.0.0.1', ok));
+    const port = s.address().port;
+    const out = path.join(work, 'o.bin');
+    const url1 = `http://${USER}:${PASS}@127.0.0.1:${port}/f.bin?X-Amz-Signature=${SIG1}&token=${TOK}`;
+    const url2 = `http://${USER}:${PASS}@127.0.0.1:${port}/f.bin?X-Amz-Signature=${SIG2}&token=${TOK}`;
+    const secrets = [USER, PASS, SIG1, SIG2, TOK];
+    const scan = () => {
+      const hits = [];
+      const walk = (d) => { for (const f of fs.readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, f.name);
+        if (f.isDirectory()) walk(p);
+        else { const body = fs.readFileSync(p).toString('latin1'); for (const x of secrets) if (body.includes(x)) hits.push(path.relative(work, p) + ' contains ' + x); }
+      } };
+      walk(work);
+      return hits;
+    };
+    try {
+      const c = spawn('node', [H.AGENT_DLA, url1, '-o', out, '-n', '4'], { cwd: work });
+      const closed = new Promise((r) => c.on('close', r));
+      let stdout1 = '';
+      c.stdout.on('data', (d) => (stdout1 += d)); c.stderr.on('data', (d) => (stdout1 += d));
+      const progressed = () => {
+        try { const mf = JSON.parse(fs.readFileSync(out + '.manifest.json', 'utf8')); return (mf.done || []).length > 0 || Object.keys(mf.active || {}).length > 0; }
+        catch { return false; }
+      };
+      for (let i = 0; i < 300 && !progressed(); i++) await H.sleep(100);
+      assert.ok(progressed(), 'first run made progress before the kill');
+      c.kill(); await closed;
+      assert.deepEqual(scan(), [], 'nothing on disk after a killed run (manifest, partial, sidecars)');
+      assert.ok(!stdout1.includes(SIG1) && !stdout1.includes(PASS), 'nothing in output');
+      // Rerun with a refreshed signature: same file, key unchanged, must resume.
+      const r = await H.runAccel([url2, '-o', out, '-n', '4', '--json'], { cwd: work, timeoutMs: 100000 });
+      assert.equal(r.code, 0, r.stderr.slice(-300));
+      assert.equal(H.sha256(out), hash);
+      assert.match(r.stderr, /Resuming/, 'resumed despite a different signature');
+      assert.deepEqual(scan(), [], 'nothing on disk after completion (receipt included)');
+      assert.ok(!(r.stdout + r.stderr).includes(PASS) && !(r.stdout + r.stderr).includes(SIG2), 'nothing in output');
+    } finally {
+      s.close();
+    }
+  });
+
   it('single-stream trickle (bytes per attempt) still exhausts --max-retries', { timeout: 60000 }, async () => {
     const work = H.workdir('rel-single-trickle');
     const buf = crypto.randomBytes(1 * MB);
@@ -1889,7 +1974,8 @@ describe('reliability', () => {
       buf.copy(partial, 16 * MB, 16 * MB, 20 * MB);
       fs.writeFileSync(out + '.partial', partial);
       const key = `${new URL(url).origin}/f.bin|${24 * MB}||`;
-      fs.writeFileSync(out + '.manifest.json', JSON.stringify({ key, done: [[4 * MB, 12 * MB - 1], [16 * MB, 20 * MB - 1]], active: {} }));
+      const keyHash = crypto.createHash('sha256').update(key).digest('hex'); // state files store a hash of the key
+      fs.writeFileSync(out + '.manifest.json', JSON.stringify({ keyHash, done: [[4 * MB, 12 * MB - 1], [16 * MB, 20 * MB - 1]], active: {} }));
       ranges.length = 0;
       const r = await H.runAccel([url, '-o', out, '-n', '4', '--json'], { cwd: work });
       assert.equal(r.code, 0, r.stderr.slice(-300));

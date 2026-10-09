@@ -404,6 +404,9 @@ function manifestKey(targetUrl, size, etag, mtime) {
     return `${u.origin}${u.pathname}${stripSigQuery(u.search)}|${size}|${etag || ''}|${mtime || ''}`;
   } catch { return `${String(targetUrl)}|${size}|${etag || ''}|${mtime || ''}`; }
 }
+// Identity keys can contain a secret (token= is kept in the key). State files
+// on disk store only this SHA-256 of the key; checks hash the live key the same way.
+function keyHashOf(k) { return crypto.createHash('sha256').update(String(k)).digest('hex'); }
 // Shared redirect policy: capped chain, http(s) only, no https->http downgrade.
 function redirectTarget(res, base, depth) {
   if (![301, 302, 303, 307, 308].includes(res.statusCode) || !res.headers.location) return null;
@@ -832,7 +835,7 @@ async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0, side
   const partialPath = outPath + '.partial';
   const sidecarPath = outPath + '.single.json';
   const readSidecar = () => { try { const s = JSON.parse(fs.readFileSync(sidecarPath, 'utf8')); return s && typeof s === 'object' ? s : null; } catch { return null; } };
-  const writeSidecar = () => { try { fs.writeFileSync(sidecarPath, JSON.stringify({ key: sideKey })); } catch {} };
+  const writeSidecar = () => { try { fs.writeFileSync(sidecarPath, JSON.stringify({ keyHash: keyHashOf(sideKey) })); } catch {} };
   const truncate = () => { try { fs.unlinkSync(partialPath); } catch {} try { fs.unlinkSync(sidecarPath); } catch {} };
   // Resume only a download this tool started (sidecar key match). Anything
   // else is a stranger's file: --overwrite (or a key mismatch) truncates.
@@ -840,7 +843,7 @@ async function downloadSingle(url, outPath, proxyUrl, totalSize, depth = 0, side
   if (opts.overwrite) truncate();
   else {
     const sc = readSidecar();
-    if (sc && sc.key === sideKey && fs.existsSync(partialPath)) {
+    if (sc && sc.keyHash === keyHashOf(sideKey) && fs.existsSync(partialPath)) {
       start = fs.statSync(partialPath).size;
       if (totalSize && start > totalSize) { truncate(); start = 0; }
       // Unknown total size: a resumed 206 cannot be checked for completeness
@@ -1226,7 +1229,7 @@ async function runDownloadInner(targetUrl, retryOpts = {}) {
     try {
       fs.mkdirSync(receiptDir, { recursive: true });
       const body = JSON.stringify({
-        key: fileKey, url: originalTarget, size: info.size,
+        keyHash: keyHashOf(fileKey), url: displayUrl(originalTarget, true), size: info.size,
         etag: info.etag || null, mtime: info.mtime || null, sha256: sha || null,
       });
       const tmp = `${receiptPath}.${process.pid}.tmp`;
@@ -1272,7 +1275,7 @@ async function runDownloadInner(targetUrl, retryOpts = {}) {
   const outComplete = !!(outStat && info.size && outStat.size === info.size);
   if (outComplete) {
     const rc = readReceipt();
-    if (rc && rc.key === fileKey) {
+    if (rc && rc.keyHash === keyHashOf(fileKey)) {
       if (EXPECT_SHA) {
         say('Found complete file, verifying sha256...');
         const got = await sha256File(outPath);
@@ -1491,7 +1494,7 @@ async function runDownloadInner(targetUrl, retryOpts = {}) {
   const partialStat = (() => { try { return fs.statSync(partialPath); } catch { return null; } })();
   try {
     const m = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-    if (m && m.key === fileKey && Array.isArray(m.done) && m.done.every(validIv)
+    if (m && m.keyHash === keyHashOf(fileKey) && Array.isArray(m.done) && m.done.every(validIv)
       && partialStat && partialStat.size === size) {
       doneIv = mergeIv([...m.done, ...Object.values(m.active || {}).filter((a) => Array.isArray(a) && a[1] > a[0]).map(([s, c]) => [s, c - 1]).filter(validIv)]);
       say(`Resuming from manifest (${doneIv.reduce((t, [s, e]) => t + (e - s + 1), 0)} of ${size} bytes kept).`);
@@ -1514,7 +1517,7 @@ async function runDownloadInner(targetUrl, retryOpts = {}) {
   const writeManifest = (snap) => {
     try {
       const body = JSON.stringify({
-        key: fileKey, url: originalTarget, size, etag: info.etag || null, mtime: info.mtime || null,
+        keyHash: keyHashOf(fileKey), url: displayUrl(originalTarget, true), size, etag: info.etag || null, mtime: info.mtime || null,
         done: doneIv, active: snap || snapshotActive(),
       });
       fs.writeFileSync(manifestPath + '.tmp', body);

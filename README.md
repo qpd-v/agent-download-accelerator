@@ -113,6 +113,8 @@ strings, and fragments; `--redact` extends that to human logs.
   while a refreshed presigned URL resumes the same file with or without an
   ETag.
   A republished file (validator change) restarts clean instead of mixing versions.
+  State files (`<out>.manifest.json`, receipts, `<out>.single.json`) hold a SHA-256 of the
+  identity key and a redacted URL: no userinfo, signed-link parameters or tokens.
   Identity does not include credentials: if the same URL serves different
   content per account (userinfo, `--header "Authorization: ..."`, cookies),
   use a distinct `-o` name per account so receipts and partials are not shared.

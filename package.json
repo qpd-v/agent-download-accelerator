@@ -1,6 +1,6 @@
 {
   "name": "agent-dla",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Agent Download Accelerator: parallel Range chunks, mirrors, proxy rotation, resume",
   "keywords": [
     "download",
